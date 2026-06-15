@@ -749,6 +749,18 @@ class Platform:
         return CpuArchEnum.OTHER if machine else CpuArchEnum.UNKNOWN
 
     @classmethod
+    def is_confidential_compute_enabled(cls) -> bool:
+        """Whether the platform is running under confidential compute (a TEE).
+
+        Under confidential compute, host<->device transfers are routed through
+        an encrypted bounce path whose crypto is CPU-bound, so pinned host
+        memory provides no async-DMA benefit. Used by ``prefer_pinned()`` to
+        choose pageable over pinned staging. Defaults to False; overridden by
+        platforms that can detect a TEE (e.g. CUDA via NVML).
+        """
+        return False
+
+    @classmethod
     def is_pin_memory_available(cls) -> bool:
         """Checks whether pin memory is available on the current platform."""
         if in_wsl():
