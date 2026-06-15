@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 from collections.abc import Callable
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from multiprocessing import Lock
 from typing import Any
 
@@ -42,6 +42,19 @@ class AsyncOutputFuture(Future):
         return super().result()
 
 
+def _materialize_async_output(
+    async_output: AsyncModelRunnerOutput, single_value: bool
+) -> Any:
+    """Run the blocking D2H synchronize + host materialization.
+
+    Executed on a dedicated thread under confidential compute (see
+    ``UniProcExecutor``) so the engine's main loop can keep issuing the next
+    step's work while the readback's CPU-bound decrypt completes in parallel.
+    """
+    output = async_output.get_output()
+    return output if single_value else [output]
+
+
 class UniProcExecutor(Executor):
     def _init_executor(self) -> None:
         """Initialize the worker and load the model."""
@@ -67,6 +80,41 @@ class UniProcExecutor(Executor):
         else:
             self.driver_worker.load_model()
         current_platform.update_block_size_for_backend(self.vllm_config)
+
+        # Under confidential compute, the sampled-token D2H readback is
+        # CPU-bound (encrypted bounce path) and, in the single-process
+        # executor, would otherwise block the engine's main loop in
+        # AsyncOutputFuture.result(). Offload that synchronize + host
+        # materialization to a dedicated worker thread so the main loop can
+        # keep issuing the next step while the readback completes in parallel.
+        # Only meaningful with async scheduling (which provides the overlap
+        # window). Mirrors TensorRT-LLM PR #8463's sampler worker thread.
+        # Auto-enable under CC; VLLM_CC_ASYNC_OUTPUT_WORKER={0,1} forces it
+        # off/on for A/B testing within the same (CC) environment.
+        self._async_output_worker: ThreadPoolExecutor | None = None
+        _override = os.getenv("VLLM_CC_ASYNC_OUTPUT_WORKER")
+        if _override is not None:
+            self._offload_async_output = (
+                _override == "1" and self.scheduler_config.async_scheduling
+            )
+        else:
+            self._offload_async_output = (
+                self.scheduler_config.async_scheduling
+                and current_platform.is_confidential_compute_enabled()
+            )
+        if self._offload_async_output:
+            device_id = torch.cuda.current_device()
+
+            def _init_async_output_thread() -> None:
+                # A new thread does not inherit the main thread's CUDA context;
+                # bind it to the worker device to avoid creating one on device 0.
+                current_platform.set_device(torch.device(f"cuda:{device_id}"))
+
+            self._async_output_worker = ThreadPoolExecutor(
+                max_workers=1,
+                initializer=_init_async_output_thread,
+                thread_name_prefix="cc-async-output",
+            )
 
     def _distributed_args(self) -> tuple[str, int, int]:
         """Return (distributed_init_method, rank, local_rank)."""
@@ -97,6 +145,13 @@ class UniProcExecutor(Executor):
         try:
             result = run_method(self.driver_worker, method, args, kwargs)
             if isinstance(result, AsyncModelRunnerOutput):
+                output_worker = getattr(self, "_async_output_worker", None)
+                if output_worker is not None:
+                    # Eagerly start the (blocking) readback on the worker thread
+                    # so it overlaps the engine's next-step scheduling.
+                    return output_worker.submit(
+                        _materialize_async_output, result, single_value
+                    )
                 return AsyncOutputFuture(result, single_value)
             future = Future[Any]()
             future.set_result(result if single_value else [result])
@@ -139,6 +194,9 @@ class UniProcExecutor(Executor):
         return
 
     def shutdown(self) -> None:
+        if (pool := getattr(self, "_async_output_worker", None)) is not None:
+            pool.shutdown(wait=True)
+            self._async_output_worker = None
         if worker := self.driver_worker:
             worker.shutdown()
 
