@@ -47,6 +47,27 @@ def is_pin_memory_available() -> bool:
 
 
 @cache
+def prefer_pinned() -> bool:
+    """Policy: should host memory be pinned for H2D/D2H staging?
+
+    Distinct from :func:`is_pin_memory_available`, which reports *capability*
+    (and gates UVA). This reports *desirability*: pinning is only worthwhile
+    when the platform supports it AND we are not under confidential compute.
+
+    Under confidential compute, CPU<->GPU copies are forced through an
+    encrypted bounce buffer whose AES-GCM is CPU-bound on the issuing core, so
+    pinned memory yields no async-DMA benefit and measurably hurts bandwidth
+    (pinned H2D collapses to ~0.1-0.2x). Prefer pageable staging there. Mirrors
+    TensorRT-LLM's ``prefer_pinned()`` (PR #11573).
+    """
+    from vllm.platforms import current_platform
+
+    if not is_pin_memory_available():
+        return False
+    return not current_platform.is_confidential_compute_enabled()
+
+
+@cache
 def is_uva_available() -> bool:
     """Check if Unified Virtual Addressing (UVA) is available."""
     # UVA requires pinned memory.

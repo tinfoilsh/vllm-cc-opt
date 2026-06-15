@@ -115,7 +115,7 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.nvtx_pytorch_hooks import PytHooks
-from vllm.utils.platform_utils import is_pin_memory_available, num_compute_units
+from vllm.utils.platform_utils import num_compute_units, prefer_pinned
 from vllm.utils.torch_utils import (
     get_dtype_size,
     is_quantized_kv_cache,
@@ -440,7 +440,11 @@ class GPUModelRunner(
         scheduler_config = self.scheduler_config
         parallel_config = self.parallel_config
         self.device = device
-        self.pin_memory = is_pin_memory_available()
+        # Policy (prefer_pinned), not capability (is_pin_memory_available):
+        # under confidential compute we keep staging buffers pageable because
+        # pinning has no async-DMA benefit and hurts bandwidth. See
+        # vllm.utils.platform_utils.prefer_pinned / TRT-LLM PR #11573.
+        self.pin_memory = prefer_pinned()
         self.dtype = self.model_config.dtype
 
         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
@@ -581,10 +585,10 @@ class GPUModelRunner(
                     device=device,
                 )
                 self._ngram_pinned_idx_buf = torch.zeros(
-                    self.max_num_reqs, dtype=torch.long, pin_memory=True
+                    self.max_num_reqs, dtype=torch.long, pin_memory=self.pin_memory
                 )
                 self._ngram_pinned_val_buf = torch.zeros(
-                    self.max_num_reqs, dtype=torch.int32, pin_memory=True
+                    self.max_num_reqs, dtype=torch.int32, pin_memory=self.pin_memory
                 )
             elif self.speculative_config.use_gemma4_mtp():
                 self.drafter = Gemma4Proposer(self.vllm_config, self.device, self)

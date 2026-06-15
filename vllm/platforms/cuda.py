@@ -159,6 +159,43 @@ def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
     return wrapper
 
 
+@cache
+@with_nvml_context
+def confidential_compute_enabled() -> bool:
+    """Query NVML for the GPU confidential-compute (CC) state.
+
+    Returns True when GPU CC mode is active (a Hopper/Blackwell TEE) or any
+    protected multi-GPU transport (PPCIE / NVLink-encryption) is in force.
+    The result is cached: CC state is fixed for the lifetime of the process.
+
+    Why vLLM cares: under CC every CPU<->GPU copy is routed through an
+    encrypted bounce buffer and the encrypt/decrypt is CPU-bound software
+    AES-GCM on the issuing core. Pinned host memory therefore provides no
+    async-DMA benefit and measurably *hurts* (pinned H2D bandwidth collapses
+    to ~0.1-0.2x), so pinning should be disabled. Mirrors TensorRT-LLM's
+    ``confidential_compute_enabled()`` (PR #11573).
+    """
+    from ctypes import byref
+
+    try:
+        # Hopper+ exposes a richer settings query (includes multi-GPU mode).
+        settings = pynvml.c_nvmlSystemConfComputeSettings_v1_t()
+        ret = pynvml.nvmlSystemGetConfComputeSettings(byref(settings))
+        pynvml._nvmlCheckReturn(ret)
+        return (
+            settings.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+            or settings.multiGpuMode != pynvml.NVML_CC_SYSTEM_MULTIGPU_NONE
+        )
+    except pynvml.NVMLError:
+        # Older driver/GPU: fall back to the simple state query.
+        try:
+            state = pynvml.nvmlSystemGetConfComputeState()
+            return state.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+        except pynvml.NVMLError as e:
+            logger.warning("Could not query confidential compute state: %s", e)
+            return False
+
+
 class CudaPlatformBase(Platform):
     _enum = PlatformEnum.CUDA
     device_name: str = "cuda"
@@ -197,6 +234,10 @@ class CudaPlatformBase(Platform):
     @classmethod
     def manual_seed_all(cls, seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
+
+    @classmethod
+    def is_confidential_compute_enabled(cls) -> bool:
+        return confidential_compute_enabled()
 
     @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
