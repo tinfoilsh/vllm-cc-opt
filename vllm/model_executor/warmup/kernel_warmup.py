@@ -7,6 +7,7 @@ happen during model execution.
 """
 
 import hashlib
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -76,6 +77,20 @@ def kernel_warmup(worker: "Worker"):
     # FlashInfer autotune for Hopper (SM 9.0) and Blackwell (SM 10.0) GPUs
     if enable_flashinfer_autotune is False:
         logger.info("Skipping FlashInfer autotune because it is disabled.")
+    elif (
+        current_platform.is_confidential_compute_enabled()
+        and os.getenv("VLLM_CC_FORCE_FLASHINFER_AUTOTUNE") != "1"
+    ):
+        # Autotune selects kernels by timing candidates; under confidential
+        # compute that timing is unreliable (CUDA-event timing is corrupted on
+        # CC, cf. TRT-LLM #11657) and can pick worse kernels than the heuristic
+        # defaults. Skip it under CC unless explicitly forced. EXPERIMENTAL:
+        # validate with an A/B before treating as a win.
+        logger.warning(
+            "Skipping FlashInfer autotune under confidential compute "
+            "(CUDA-event timing is unreliable on CC). Set "
+            "VLLM_CC_FORCE_FLASHINFER_AUTOTUNE=1 to override."
+        )
     elif has_flashinfer() and current_platform.has_device_capability(90):
         flashinfer_autotune(worker.model_runner)
 
