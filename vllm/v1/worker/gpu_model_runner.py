@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -741,6 +742,20 @@ class GPUModelRunner(
             self.max_num_reqs, dtype=torch.int32
         )
         self.req_indices = self._make_buffer(self.max_num_tokens, dtype=torch.int64)
+        # P4 (experimental, CC-only, opt-in): coalesce per-step int64 input H2D
+        # copies into a single bounce-buffer crossing. Under CC the per-op copy
+        # toll is flat (~38us regardless of size), so fewer ops beats smaller
+        # ops. Staging arena holds the concatenated int64 inputs; the per-buffer
+        # GPU views are filled by on-GPU (untaxed) D2D splits.
+        self._cc_coalesce_h2d = (
+            os.getenv("VLLM_CC_COALESCE_H2D") == "1"
+            and current_platform.is_confidential_compute_enabled()
+        )
+        self._cc_h2d_stage_i64 = (
+            self._make_buffer(2 * self.max_num_tokens, dtype=torch.int64)
+            if self._cc_coalesce_h2d
+            else None
+        )
         # Maps current batch position -> previous batch position (-1 for new reqs)
         self.prev_positions = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
         self.num_scheduled_tokens = self._make_buffer(
@@ -1006,6 +1021,28 @@ class GPUModelRunner(
             pin_memory=self.pin_memory,
             with_numpy=numpy,
         )
+
+    def _coalesce_h2d_i64(self, *items: tuple[CpuGpuBuffer, int]) -> None:
+        """Copy several int64 buffers to the GPU in one H2D transfer (P4).
+
+        Each ``(buf, n)`` must already have ``buf.cpu[:n]`` populated. The
+        slices are packed into a single staging arena, shipped with one
+        non-blocking H2D (the only trust-boundary crossing under CC), then
+        scattered back into each ``buf.gpu[:n]`` with on-GPU (untaxed) D2D
+        copies. Equivalent to per-buffer ``copy_to_gpu`` but with one bounce
+        crossing instead of ``len(items)``.
+        """
+        stage = self._cc_h2d_stage_i64
+        assert stage is not None
+        off = 0
+        for buf, n in items:
+            stage.cpu[off : off + n] = buf.cpu[:n]
+            off += n
+        stage.copy_to_gpu(off)
+        off = 0
+        for buf, n in items:
+            buf.gpu[:n].copy_(stage.gpu[off : off + n], non_blocking=True)
+            off += n
 
     def _get_mamba_bufs(self) -> mamba_utils.MambaBuffers:
         # Only reachable on the ``mamba_cache_mode == "align"`` path.
@@ -2099,10 +2136,18 @@ class GPUModelRunner(
             )
 
         self.req_indices.np[:total_num_scheduled_tokens] = req_indices
-        self.req_indices.copy_to_gpu(total_num_scheduled_tokens)
+        if self._cc_coalesce_h2d:
+            # query_pos.cpu was populated upstream (_get_cumsum_and_arange);
+            # both are int64 of length total_num_scheduled_tokens, so a single
+            # H2D crossing replaces the two separate copies.
+            self._coalesce_h2d_i64(
+                (self.req_indices, total_num_scheduled_tokens),
+                (self.query_pos, total_num_scheduled_tokens),
+            )
+        else:
+            self.req_indices.copy_to_gpu(total_num_scheduled_tokens)
+            self.query_pos.copy_to_gpu(total_num_scheduled_tokens)
         req_indices_gpu = self.req_indices.gpu[:total_num_scheduled_tokens]
-
-        self.query_pos.copy_to_gpu(total_num_scheduled_tokens)
         self.num_scheduled_tokens.np[:num_reqs] = num_scheduled_tokens
         self.num_scheduled_tokens.copy_to_gpu(num_reqs)
         num_scheduled_tokens_gpu = self.num_scheduled_tokens.gpu[:num_reqs]
