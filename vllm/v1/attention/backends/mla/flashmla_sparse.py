@@ -15,7 +15,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
 )
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
-from vllm.utils.platform_utils import num_compute_units
+from vllm.utils.platform_utils import num_compute_units, prefer_pinned
 from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -402,7 +402,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
 
             # will be adjusted by chunk loop
             prefill_workspace_starts_cpu = torch.zeros(
-                num_prefills, dtype=torch.int32, pin_memory=True
+                num_prefills, dtype=torch.int32, pin_memory=prefer_pinned()
             )
             prefill_workspace_starts_cpu[1:] = torch.cumsum(
                 prefill_seq_lens_cpu[:-1], dim=0
