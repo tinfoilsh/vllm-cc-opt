@@ -1456,6 +1456,24 @@ class CompilationConfig:
                 "gpu_memory_utilization."
             )
 
+        # Under confidential compute the per-kernel launch tax is large
+        # (encrypted command submission, ~3.5-4x), so capturing the decode hot
+        # loop as FULL CUDA graphs is the single biggest perf lever. Warn if
+        # decode will run without full graphs (NONE / eager / piecewise-decode)
+        # since that path is launch-bound under CC.
+        if cudagraph_mode.decode_mode() != CUDAGraphMode.FULL:
+            from vllm.platforms import current_platform
+
+            if current_platform.is_confidential_compute_enabled():
+                logger.warning(
+                    "Confidential compute is enabled but decode CUDA graphs are "
+                    "not FULL (cudagraph_mode=%s). Under CC the per-kernel launch "
+                    "tax is large (~3.5-4x); full decode graphs remove most of "
+                    "it. Prefer cudagraph_mode=FULL_AND_PIECEWISE and avoid "
+                    "--enforce-eager for CC serving.",
+                    cudagraph_mode.name,
+                )
+
         self.cudagraph_mode = cudagraph_mode
         return cudagraph_mode
 
