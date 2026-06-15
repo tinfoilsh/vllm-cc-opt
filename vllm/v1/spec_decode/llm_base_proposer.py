@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from importlib.util import find_spec
 from typing import Any, cast
 
@@ -398,16 +399,37 @@ class SpecDecodeBaseProposer:
         Only supports PIECEWISE cudagraphs (via mixed_mode).
         This should be called after adjust_cudagraph_sizes_for_spec_decode.
         """
-        if (
-            not self.speculative_config.enforce_eager
-            and cudagraph_mode.mixed_mode()
-            in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]
+        if self.speculative_config.enforce_eager:
+            eagle_cudagraph_mode = CUDAGraphMode.NONE
+        elif (
+            cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+            and self._cc_drafter_full_graph_enabled()
         ):
+            # EXPERIMENTAL (P5): under confidential compute the per-kernel
+            # launch tax is ~3.5-4x, and spec decode pays it on every draft
+            # step (the drafter is otherwise piecewise-only). When the main
+            # model already runs FULL decode graphs, capture the drafter's
+            # decode as FULL too to remove that tax. Opt-in via
+            # VLLM_CC_DRAFTER_FULL_GRAPH=1; the drafter's own decode query len
+            # is 1, so default uniform-decode FULL keys apply.
+            eagle_cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+        elif cudagraph_mode.mixed_mode() in [
+            CUDAGraphMode.PIECEWISE,
+            CUDAGraphMode.FULL,
+        ]:
             eagle_cudagraph_mode = CUDAGraphMode.PIECEWISE
         else:
             eagle_cudagraph_mode = CUDAGraphMode.NONE
 
         self.cudagraph_dispatcher.initialize_cudagraph_keys(eagle_cudagraph_mode)
+
+    @staticmethod
+    def _cc_drafter_full_graph_enabled() -> bool:
+        if os.getenv("VLLM_CC_DRAFTER_FULL_GRAPH") != "1":
+            return False
+        from vllm.platforms import current_platform
+
+        return current_platform.is_confidential_compute_enabled()
 
     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Greedy-sample draft tokens from hidden states."""
