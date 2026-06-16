@@ -252,6 +252,7 @@ class ExtractHiddenStatesProposer:
     def dummy_run(
         self,
         num_tokens: int,
+        common_attn_metadata=None,
         use_cudagraphs: bool = True,
         is_graph_capturing: bool = False,
         slot_mappings: dict[str, torch.Tensor] | None = None,

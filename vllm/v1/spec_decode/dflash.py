@@ -201,6 +201,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
     def dummy_run(
         self,
         num_tokens: int,
+        common_attn_metadata=None,
         use_cudagraphs: bool = True,
         is_graph_capturing: bool = False,
         slot_mappings: dict[str, torch.Tensor] | None = None,
@@ -214,7 +215,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         - Multimodal inputs are not currently supported
         """
         num_query_tokens = min(num_tokens, self.max_query_tokens)
-        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
+        cudagraph_runtime_mode, _, num_input_tokens, num_tokens_across_dp = (
             self._determine_batch_execution_and_padding(
                 num_query_tokens, use_cudagraphs=use_cudagraphs
             )

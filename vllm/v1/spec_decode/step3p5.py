@@ -286,6 +286,7 @@ class Step3p5MTPProposer(EagleProposer):
         slot_mappings: dict[str, torch.Tensor]
         | list[dict[str, torch.Tensor]]
         | None = None,
+        target_model_batch_desc=None,
     ) -> torch.Tensor:
         self.num_speculative_tokens = num_speculative_tokens
         self._last_draft_probs = None
@@ -307,7 +308,7 @@ class Step3p5MTPProposer(EagleProposer):
             self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
         )
 
-        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
+        cudagraph_runtime_mode, _, num_input_tokens, num_tokens_across_dp = (
             self._determine_batch_execution_and_padding(num_tokens)
         )
 
@@ -371,7 +372,7 @@ class Step3p5MTPProposer(EagleProposer):
 
         draft_token_ids_list = [draft_token_ids]
 
-        cudagraph_runtime_mode, input_batch_size, batch_size_across_dp = (
+        cudagraph_runtime_mode, _, input_batch_size, batch_size_across_dp = (
             self._determine_batch_execution_and_padding(batch_size)
         )
 

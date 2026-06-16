@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -542,6 +543,15 @@ class GPUModelRunner(
         self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
 
         self.use_aux_hidden_state_outputs = False
+        # P5 / PR #34880 (experimental, opt-in): capture the spec-decode
+        # drafter's chain steps as FULL cudagraphs. Gated on
+        # VLLM_CC_DRAFTER_FULL_GRAPH=1 so the default path is unchanged.
+        self.supports_sd_full_graph = (
+            os.getenv("VLLM_CC_DRAFTER_FULL_GRAPH") == "1"
+            and self.speculative_config is not None
+            and self.speculative_config.use_eagle()
+            and not self.speculative_config.disable_padded_drafter_batch
+        )
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
@@ -2496,12 +2506,15 @@ class GPUModelRunner(
                 else:
                     _build_attn_group_metadata(kv_cache_gid, attn_gid, cm)
 
-        if spec_decode_common_attn_metadata is not None and (
-            num_reqs != num_reqs_padded or num_tokens != num_tokens_padded
+        if (
+            spec_decode_common_attn_metadata is not None
+            and (num_reqs != num_reqs_padded or num_tokens != num_tokens_padded)
+            and not self.supports_sd_full_graph
         ):
-            # Currently the drafter still only uses piecewise cudagraphs (and modifies
-            # the attention metadata in directly), and therefore does not want to use
-            # padded attention metadata.
+            # By default the drafter only uses piecewise cudagraphs (and modifies
+            # the attention metadata in place), and therefore does not want to use
+            # padded attention metadata. With FULL drafter graphs (P5) we keep the
+            # padded metadata so the captured graph matches runtime.
             spec_decode_common_attn_metadata = (
                 spec_decode_common_attn_metadata.unpadded(num_tokens, num_reqs)
             )
@@ -4294,6 +4307,15 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
+        # Stash the target model's batch descriptor + padded request count so
+        # the drafter can dispatch matching FULL cudagraphs (P5 / PR #34880).
+        self._target_model_batch_desc = batch_desc
+        self.input_batch.num_reqs_padded = (
+            batch_desc.num_reqs
+            if batch_desc.num_reqs is not None
+            else self.input_batch.num_reqs
+        )
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
@@ -5086,6 +5108,7 @@ class GPUModelRunner(
                         common_attn_metadata,
                         spec_decode_metadata,
                         valid_sampled_tokens_count,
+                        self.input_batch,
                     )
                     total_num_tokens = common_attn_metadata.num_actual_tokens
                     # When padding the batch, token_indices is just a range
@@ -5119,6 +5142,9 @@ class GPUModelRunner(
                 mm_embed_inputs=mm_embed_inputs,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
+                target_model_batch_desc=getattr(
+                    self, "_target_model_batch_desc", None
+                ),
             )
             if hasattr(self.drafter, "take_last_draft_probs"):
                 draft_probs = self.drafter.take_last_draft_probs()
@@ -5810,6 +5836,7 @@ class GPUModelRunner(
         )
 
         attn_metadata: PerLayerAttnMetadata | None = None
+        spec_decode_cm: CommonAttentionMetadata | None = None
 
         slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
             num_tokens_padded=num_tokens_padded,
@@ -5864,7 +5891,7 @@ class GPUModelRunner(
                 self.input_batch.block_table.commit_block_table(num_reqs_padded)
 
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
-                attn_metadata, _ = self._build_attention_metadata(
+                attn_metadata, spec_decode_cm = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded if pad_attn else None,
                     num_reqs=num_reqs_padded,
@@ -5971,13 +5998,16 @@ class GPUModelRunner(
                     | Gemma4Proposer,
                 )
                 assert self.speculative_config is not None
-                # Eagle currently only supports PIECEWISE cudagraphs.
-                # Therefore only use cudagraphs if the main model uses PIECEWISE
-                # NOTE(lucas): this is a hack, need to clean up.
+                # By default the drafter only uses PIECEWISE cudagraphs, so it
+                # only captures when the main model is PIECEWISE. With FULL
+                # drafter graphs (P5), allow capture under FULL too.
                 use_cudagraphs = (
                     (
                         is_graph_capturing
-                        and cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
+                        and (
+                            cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
+                            or self.supports_sd_full_graph
+                        )
                     )
                     or (
                         not is_graph_capturing
@@ -5997,6 +6027,9 @@ class GPUModelRunner(
 
                 self.drafter.dummy_run(
                     num_tokens,
+                    common_attn_metadata=(
+                        spec_decode_cm if self.supports_sd_full_graph else None
+                    ),
                     use_cudagraphs=use_cudagraphs,
                     is_graph_capturing=is_graph_capturing,
                     slot_mappings=slot_mappings,
