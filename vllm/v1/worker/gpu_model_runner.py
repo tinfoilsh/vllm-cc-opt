@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -696,6 +697,16 @@ class GPUModelRunner(
         if self.use_async_scheduling:
             self.async_output_copy_stream = torch.cuda.Stream()
             self.prepare_inputs_event = torch.Event()
+
+        self.cc_decode_metadata_fastpath = int(
+            os.environ.get("VLLM_CC_DECODE_METADATA_FASTPATH", "0") or "0"
+        )
+        if self.cc_decode_metadata_fastpath > 0:
+            logger.info("Using experimental CC uniform-decode metadata fast path.")
+        self._cc_decode_metadata_arange_i32_gpu: torch.Tensor | None = None
+        self._cc_decode_metadata_arange_i64_gpu: torch.Tensor | None = None
+        self._cc_decode_metadata_fast_ready_req_ids: tuple[str, ...] | None = None
+        self._cc_decode_metadata_has_logged_engaged = False
 
         # self.cudagraph_batch_sizes sorts in ascending order.
         if (
@@ -1683,6 +1694,121 @@ class GPUModelRunner(
 
         return cu_num_tokens
 
+    def _ensure_cc_decode_metadata_buffers(self) -> None:
+        if self._cc_decode_metadata_arange_i32_gpu is not None:
+            return
+
+        arange_size = max(self.max_num_reqs + 1, self.max_num_tokens)
+        self._cc_decode_metadata_arange_i32_gpu = torch.arange(
+            arange_size, dtype=torch.int32, device=self.device
+        )
+        self._cc_decode_metadata_arange_i64_gpu = torch.arange(
+            arange_size, dtype=torch.int64, device=self.device
+        )
+
+    def _cc_uniform_decode_metadata_primeable(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_scheduled_tokens: np.ndarray,
+        num_reqs: int,
+        total_num_scheduled_tokens: int,
+        prev_req_id_to_index: dict[str, int] | None,
+    ) -> bool:
+        if self.cc_decode_metadata_fastpath <= 0:
+            return False
+        if not self.use_async_scheduling:
+            return False
+        if self.uses_mrope or self.uses_xdrope_dim > 0:
+            return False
+        if self.enable_prompt_embeds or self.input_batch.req_prompt_embeds:
+            return False
+        if self.num_accepted_tokens_event is not None:
+            return False
+        if self.mamba_prev_last_scheduled_idx is not None:
+            return False
+        if scheduler_output.scheduled_spec_decode_tokens:
+            return False
+        if scheduler_output.scheduled_new_reqs or scheduler_output.finished_req_ids:
+            return False
+        if scheduler_output.preempted_req_ids:
+            return False
+        cached = scheduler_output.scheduled_cached_reqs
+        if cached.resumed_req_ids:
+            return False
+        if total_num_scheduled_tokens != num_reqs:
+            return False
+        if not np.all(num_scheduled_tokens[:num_reqs] == 1):
+            return False
+        if prev_req_id_to_index is None:
+            return False
+
+        req_ids = self.input_batch.req_ids[:num_reqs]
+        for idx, req_id in enumerate(req_ids):
+            if prev_req_id_to_index.get(req_id) != idx:
+                return False
+
+        num_computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+        num_prompt = self.input_batch.num_prompt_tokens[:num_reqs]
+        return bool(np.all(num_computed >= num_prompt))
+
+    def _cc_uniform_decode_metadata_fastpath_ready(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_scheduled_tokens: np.ndarray,
+        num_reqs: int,
+        total_num_scheduled_tokens: int,
+        prev_req_id_to_index: dict[str, int] | None,
+    ) -> bool:
+        if not self._cc_uniform_decode_metadata_primeable(
+            scheduler_output,
+            num_scheduled_tokens,
+            num_reqs,
+            total_num_scheduled_tokens,
+            prev_req_id_to_index,
+        ):
+            return False
+        return self._cc_decode_metadata_fast_ready_req_ids == tuple(
+            self.input_batch.req_ids[:num_reqs]
+        )
+
+    def _mark_cc_uniform_decode_metadata_ready(
+        self,
+        primeable: bool,
+        num_reqs: int,
+    ) -> None:
+        if self.cc_decode_metadata_fastpath <= 0:
+            return
+        self._cc_decode_metadata_fast_ready_req_ids = (
+            tuple(self.input_batch.req_ids[:num_reqs]) if primeable else None
+        )
+
+    def _prepare_cc_uniform_decode_static_metadata(self, num_reqs: int) -> None:
+        self._ensure_cc_decode_metadata_buffers()
+        assert self._cc_decode_metadata_arange_i32_gpu is not None
+        assert self._cc_decode_metadata_arange_i64_gpu is not None
+
+        if not self._cc_decode_metadata_has_logged_engaged:
+            logger.info(
+                "VLLM_CC_DECODE_METADATA_FASTPATH engaged: batch=%d", num_reqs
+            )
+            self._cc_decode_metadata_has_logged_engaged = True
+
+        self.query_start_loc.np[: num_reqs + 1] = self.arange_np[: num_reqs + 1]
+        self.query_start_loc.np[num_reqs + 1 :].fill(num_reqs)
+        self.query_start_loc.gpu[: num_reqs + 1].copy_(
+            self._cc_decode_metadata_arange_i32_gpu[: num_reqs + 1]
+        )
+        self.query_start_loc.gpu[num_reqs + 1 :].fill_(num_reqs)
+
+        self.discard_request_mask.np[:num_reqs] = False
+        self.discard_request_mask.gpu[:num_reqs].zero_()
+
+        self.req_indices.gpu[:num_reqs].copy_(
+            self._cc_decode_metadata_arange_i64_gpu[:num_reqs]
+        )
+        self.query_pos.gpu[:num_reqs].zero_()
+        self.num_scheduled_tokens.gpu[:num_reqs].fill_(1)
+
     def _compute_prev_positions(self, num_reqs: int) -> None:
         """Build prev_positions mapping: current pos -> previous pos (-1 if new).
 
@@ -1900,12 +2026,31 @@ class GPUModelRunner(
         cu_num_tokens = self._get_cumsum_and_arange(
             num_scheduled_tokens, self.query_pos.np
         )
-
-        # Get positions.
-        positions_np = (
-            self.input_batch.num_computed_tokens_cpu[req_indices]
-            + self.query_pos.np[: cu_num_tokens[-1]]
+        prev_req_id_to_index = self.input_batch.prev_req_id_to_index
+        cc_decode_metadata_primeable = self._cc_uniform_decode_metadata_primeable(
+            scheduler_output,
+            num_scheduled_tokens,
+            num_reqs,
+            total_num_scheduled_tokens,
+            prev_req_id_to_index,
         )
+        cc_decode_metadata_fastpath = (
+            cc_decode_metadata_primeable
+            and self._cc_uniform_decode_metadata_fastpath_ready(
+                scheduler_output,
+                num_scheduled_tokens,
+                num_reqs,
+                total_num_scheduled_tokens,
+                prev_req_id_to_index,
+            )
+        )
+
+        if not cc_decode_metadata_fastpath:
+            # Get positions.
+            positions_np = (
+                self.input_batch.num_computed_tokens_cpu[req_indices]
+                + self.query_pos.np[: cu_num_tokens[-1]]
+            )
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -1917,78 +2062,82 @@ class GPUModelRunner(
         if self.uses_xdrope_dim > 0:
             self._calc_xdrope_positions(scheduler_output)
 
-        # Get token indices.
-        # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-        # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
-        # where M is the max_model_len.
-        token_indices = (
-            positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
-        )
-        token_indices_tensor = torch.from_numpy(token_indices)
+        if not cc_decode_metadata_fastpath:
+            # Get token indices.
+            # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+            # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
+            # where M is the max_model_len.
+            token_indices = (
+                positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
+            )
+            token_indices_tensor = torch.from_numpy(token_indices)
 
-        # NOTE(woosuk): We use torch.index_select instead of np.take here
-        # because torch.index_select is much faster than np.take for large
-        # tensors.
-        torch.index_select(
-            self.input_batch.token_ids_cpu_tensor.flatten(),
-            0,
-            token_indices_tensor,
-            out=self.input_ids.cpu[:total_num_scheduled_tokens],
-        )
-        if self.enable_prompt_embeds:
-            is_token_ids = self.input_batch.is_token_ids_tensor.flatten()
+            # NOTE(woosuk): We use torch.index_select instead of np.take here
+            # because torch.index_select is much faster than np.take for large
+            # tensors.
             torch.index_select(
-                is_token_ids,
+                self.input_batch.token_ids_cpu_tensor.flatten(),
                 0,
                 token_indices_tensor,
-                out=self.is_token_ids.cpu[:total_num_scheduled_tokens],
+                out=self.input_ids.cpu[:total_num_scheduled_tokens],
             )
+            if self.enable_prompt_embeds:
+                is_token_ids = self.input_batch.is_token_ids_tensor.flatten()
+                torch.index_select(
+                    is_token_ids,
+                    0,
+                    token_indices_tensor,
+                    out=self.is_token_ids.cpu[:total_num_scheduled_tokens],
+                )
 
-        # Because we did not pre-allocate a massive prompt_embeds CPU tensor on
-        # the InputBatch, we need to fill in the prompt embeds into the expected
-        # spots in the GpuModelRunner's pre-allocated prompt_embeds tensor.
-        if self.input_batch.req_prompt_embeds:
-            output_idx = 0
-            for req_idx in range(num_reqs):
-                num_sched = num_scheduled_tokens[req_idx]
+            # Because we did not pre-allocate a massive prompt_embeds CPU tensor on
+            # the InputBatch, we need to fill in the prompt embeds into the expected
+            # spots in the GpuModelRunner's pre-allocated prompt_embeds tensor.
+            if self.input_batch.req_prompt_embeds:
+                output_idx = 0
+                for req_idx in range(num_reqs):
+                    num_sched = num_scheduled_tokens[req_idx]
 
-                # Skip if this request doesn't have embeddings
-                if req_idx not in self.input_batch.req_prompt_embeds:
+                    # Skip if this request doesn't have embeddings
+                    if req_idx not in self.input_batch.req_prompt_embeds:
+                        output_idx += num_sched
+                        continue
+
+                    # Skip if no tokens scheduled
+                    if num_sched <= 0:
+                        output_idx += num_sched
+                        continue
+
+                    req_embeds = self.input_batch.req_prompt_embeds[req_idx]
+                    start_pos = self.input_batch.num_computed_tokens_cpu[req_idx]
+
+                    # Skip if trying to read beyond available embeddings
+                    if start_pos >= req_embeds.shape[0]:
+                        output_idx += num_sched
+                        continue
+
+                    # Copy available embeddings
+                    end_pos = start_pos + num_sched
+                    actual_end = min(end_pos, req_embeds.shape[0])
+                    actual_num_sched = actual_end - start_pos
+
+                    if actual_num_sched > 0:
+                        self.inputs_embeds.cpu[
+                            output_idx : output_idx + actual_num_sched
+                        ].copy_(req_embeds[start_pos:actual_end])
+
                     output_idx += num_sched
-                    continue
-
-                # Skip if no tokens scheduled
-                if num_sched <= 0:
-                    output_idx += num_sched
-                    continue
-
-                req_embeds = self.input_batch.req_prompt_embeds[req_idx]
-                start_pos = self.input_batch.num_computed_tokens_cpu[req_idx]
-
-                # Skip if trying to read beyond available embeddings
-                if start_pos >= req_embeds.shape[0]:
-                    output_idx += num_sched
-                    continue
-
-                # Copy available embeddings
-                end_pos = start_pos + num_sched
-                actual_end = min(end_pos, req_embeds.shape[0])
-                actual_num_sched = actual_end - start_pos
-
-                if actual_num_sched > 0:
-                    self.inputs_embeds.cpu[
-                        output_idx : output_idx + actual_num_sched
-                    ].copy_(req_embeds[start_pos:actual_end])
-
-                output_idx += num_sched
 
         # Prepare the attention metadata.
-        self.query_start_loc.np[0] = 0
-        self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
-        # Note: pad query_start_loc to be non-decreasing, as kernels
-        # like FlashAttention requires that
-        self.query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
-        self.query_start_loc.copy_to_gpu()
+        if cc_decode_metadata_fastpath:
+            self._prepare_cc_uniform_decode_static_metadata(num_reqs)
+        else:
+            self.query_start_loc.np[0] = 0
+            self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
+            # Note: pad query_start_loc to be non-decreasing, as kernels
+            # like FlashAttention requires that
+            self.query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
+            self.query_start_loc.copy_to_gpu()
         query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
 
         # Compute optimistic seq_lens (assumes all draft tokens from previous
@@ -2004,18 +2153,18 @@ class GPUModelRunner(
 
         # Build prev_positions mapping: current pos -> prev pos (-1 if new).
         # Used for gathering from previous iteration's GPU tensors.
-        prev_req_id_to_index = self.input_batch.prev_req_id_to_index
         self._compute_prev_positions(num_reqs)
 
-        num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
-        num_tokens_np = np.array(num_tokens, dtype=np.int32)
+        if not cc_decode_metadata_fastpath:
+            num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
+            num_tokens_np = np.array(num_tokens, dtype=np.int32)
 
-        # Record which requests should not be sampled,
-        # so that we could clear the sampled tokens before returning
-        self.discard_request_mask.np[:num_reqs] = (
-            self.optimistic_seq_lens_cpu[:num_reqs].numpy() < num_tokens_np
-        )
-        self.discard_request_mask.copy_to_gpu(num_reqs)
+            # Record which requests should not be sampled,
+            # so that we could clear the sampled tokens before returning
+            self.discard_request_mask.np[:num_reqs] = (
+                self.optimistic_seq_lens_cpu[:num_reqs].numpy() < num_tokens_np
+            )
+            self.discard_request_mask.copy_to_gpu(num_reqs)
 
         # Sync num_accepted_tokens from CPU (set by
         # _update_states_after_model_execute for hybrid models).
@@ -2058,7 +2207,9 @@ class GPUModelRunner(
         # CPU values are optimistic (all drafts accepted). The kernel
         # corrects on GPU using the previous step's
         # valid_sampled_token_count_gpu. Otherwise, just copy from CPU.
-        if (
+        if cc_decode_metadata_fastpath:
+            self.num_computed_tokens[:num_reqs].add_(1)
+        elif (
             self.use_async_spec_decode
             and self.valid_sampled_token_count_gpu is not None
             and prev_req_id_to_index
@@ -2082,13 +2233,15 @@ class GPUModelRunner(
                 non_blocking=True,
             )
 
-        self.req_indices.np[:total_num_scheduled_tokens] = req_indices
-        self.req_indices.copy_to_gpu(total_num_scheduled_tokens)
+        if not cc_decode_metadata_fastpath:
+            self.req_indices.np[:total_num_scheduled_tokens] = req_indices
+            self.req_indices.copy_to_gpu(total_num_scheduled_tokens)
         req_indices_gpu = self.req_indices.gpu[:total_num_scheduled_tokens]
 
-        self.query_pos.copy_to_gpu(total_num_scheduled_tokens)
-        self.num_scheduled_tokens.np[:num_reqs] = num_scheduled_tokens
-        self.num_scheduled_tokens.copy_to_gpu(num_reqs)
+        if not cc_decode_metadata_fastpath:
+            self.query_pos.copy_to_gpu(total_num_scheduled_tokens)
+            self.num_scheduled_tokens.np[:num_reqs] = num_scheduled_tokens
+            self.num_scheduled_tokens.copy_to_gpu(num_reqs)
         num_scheduled_tokens_gpu = self.num_scheduled_tokens.gpu[:num_reqs]
         self.positions[:total_num_scheduled_tokens] = (
             self.num_computed_tokens[req_indices_gpu].to(torch.int64)
@@ -2183,6 +2336,10 @@ class GPUModelRunner(
             self.set_active_loras(
                 self.input_batch, num_scheduled_tokens, num_sampled_tokens
             )
+
+        self._mark_cc_uniform_decode_metadata_ready(
+            cc_decode_metadata_primeable, num_reqs
+        )
 
         return (
             logits_indices,
