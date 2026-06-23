@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import numpy as np
 import torch
 
@@ -71,6 +73,10 @@ class BlockTable:
             self.max_num_reqs, self.max_num_blocks_per_req, dtype=torch.int32
         )
         self.num_blocks_per_row = np.zeros(max_num_reqs, dtype=np.int32)
+        self._block_table_dirty_commit_enabled = bool(
+            int(os.environ.get("VLLM_CC_DECODE_METADATA_FASTPATH", "0") or "0")
+        )
+        self._block_table_dirty = True
 
         self.slot_mapping = self._make_buffer(
             self.max_num_batched_tokens, dtype=torch.int64
@@ -116,15 +122,18 @@ class BlockTable:
         start = self.num_blocks_per_row[row_idx]
         self.num_blocks_per_row[row_idx] += num_blocks
         self.block_table.np[row_idx, start : start + num_blocks] = block_ids
+        self._block_table_dirty = True
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
         self.num_blocks_per_row[row_idx] = 0
         self.append_row(block_ids, row_idx)
+        self._block_table_dirty = True
 
     def clear_row(self, row_idx: int) -> None:
         num_blocks = self.num_blocks_per_row[row_idx]
         if num_blocks > 0:
             self.block_table.np[row_idx, :num_blocks] = 0
+            self._block_table_dirty = True
         self.num_blocks_per_row[row_idx] = 0
 
     def move_row(self, src: int, tgt: int) -> None:
@@ -132,11 +141,13 @@ class BlockTable:
         block_table_np = self.block_table.np
         block_table_np[tgt, :num_blocks] = block_table_np[src, :num_blocks]
         self.num_blocks_per_row[tgt] = num_blocks
+        self._block_table_dirty = True
 
     def swap_row(self, src: int, tgt: int) -> None:
         src_tgt, tgt_src = [src, tgt], [tgt, src]
         self.num_blocks_per_row[src_tgt] = self.num_blocks_per_row[tgt_src]
         self.block_table.np[src_tgt] = self.block_table.np[tgt_src]
+        self._block_table_dirty = True
 
     def compute_slot_mapping(
         self,
@@ -164,11 +175,18 @@ class BlockTable:
         )
 
     def commit_block_table(self, num_reqs: int) -> None:
-        self.block_table.copy_to_gpu(num_reqs)
+        if not self._block_table_dirty_commit_enabled:
+            self.block_table.copy_to_gpu(num_reqs)
+            return
+
+        if self._block_table_dirty:
+            self.block_table.copy_to_gpu(num_reqs)
+            self._block_table_dirty = False
 
     def clear(self) -> None:
         self.block_table.gpu.fill_(0)
         self.block_table.cpu.fill_(0)
+        self._block_table_dirty = False
 
     @staticmethod
     def map_to_kernel_blocks(
