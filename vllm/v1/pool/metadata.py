@@ -7,9 +7,9 @@ import torch
 
 from vllm.pooling_params import PoolingParams
 from vllm.tasks import PoolingTask
-from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.utils.platform_utils import prefer_pinned
 
-pin_memory = is_pin_memory_available()
+pin_memory = prefer_pinned()
 
 
 @dataclass

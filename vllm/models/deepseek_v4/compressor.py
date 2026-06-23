@@ -20,6 +20,7 @@ from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states,
 )
 from vllm.platforms import current_platform
+from vllm.utils.platform_utils import prefer_pinned
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -107,7 +108,9 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         num_reqs = common_attn_metadata.num_reqs
         query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-        x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
+        x = torch.repeat_interleave(torch.arange(num_reqs), query_lens)
+        if prefer_pinned():
+            x = x.pin_memory()
         token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
         token_to_req_indices.copy_(x, non_blocking=True)
         return CompressorMetadata(

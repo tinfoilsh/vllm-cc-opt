@@ -16,7 +16,7 @@ from cachetools import LRUCache
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.import_utils import LazyLoader
-from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.utils.platform_utils import prefer_pinned
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
 if TYPE_CHECKING:
@@ -112,7 +112,7 @@ def apply_grammar_bitmask(
             # xgrammar expects a python list of indices but it will actually work with
             # a tensor. If we copy the tensor ourselves here we can do it in a
             # non_blocking manner and there should be no cpu sync within xgrammar.
-            pin_memory = is_pin_memory_available()
+            pin_memory = prefer_pinned()
             index_tensor = torch.tensor(
                 out_indices, dtype=torch.int32, device="cpu", pin_memory=pin_memory
             )

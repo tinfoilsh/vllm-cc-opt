@@ -25,7 +25,7 @@ from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
-from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.utils.platform_utils import prefer_pinned
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
@@ -227,7 +227,7 @@ class SpecDecodeBaseProposer:
         self.backup_next_token_ids = CpuGpuBuffer(
             self.max_batch_size,
             dtype=torch.int32,
-            pin_memory=is_pin_memory_available(),
+            pin_memory=prefer_pinned(),
             device=device,
             with_numpy=True,
         )
@@ -1095,7 +1095,7 @@ class SpecDecodeBaseProposer:
         new_query_start_loc_cpu = torch.zeros(
             query_start_loc_cpu.shape,
             dtype=torch.int32,
-            pin_memory=is_pin_memory_available(),
+            pin_memory=prefer_pinned(),
         )
         new_query_start_loc_np = new_query_start_loc_cpu.numpy()
         np.cumsum(new_num_tokens_per_req_np, out=new_query_start_loc_np[1:])

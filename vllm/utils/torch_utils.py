@@ -609,9 +609,13 @@ def async_tensor_h2d(
     data: list,
     dtype: torch.dtype,
     device: str | torch.device,
-    pin_memory: bool = PIN_MEMORY,
+    pin_memory: bool | None = None,
 ) -> torch.Tensor:
     """Asynchronously create a tensor and copy it from host to device."""
+    if pin_memory is None:
+        from vllm.utils.platform_utils import prefer_pinned
+
+        pin_memory = prefer_pinned()
     t = torch.tensor(data, dtype=dtype, pin_memory=pin_memory, device="cpu")
     return t.to(device=device, non_blocking=True)
 

@@ -41,7 +41,7 @@ from vllm.utils.flashinfer import (
     use_trtllm_attention,
 )
 from vllm.utils.math_utils import cdiv
-from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.utils.platform_utils import prefer_pinned
 from vllm.utils.torch_utils import (
     canonicalize_singleton_dim_strides,
     is_quantized_kv_cache,
@@ -687,9 +687,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # Since we do not have explicit synchronization in ModelRunnerV2, we do not pin
         # reused CPU buffers to avoid a race condition between step N async copies to
         # GPU and step N+1 buffer updates.
-        self.pin_memory = (
-            not vllm_config.use_v2_model_runner and is_pin_memory_available()
-        )
+        self.pin_memory = not vllm_config.use_v2_model_runner and prefer_pinned()
         self.paged_kv_indptr = self._make_buffer(max_num_reqs + 1)
         self.paged_kv_indptr_cpu_buffer = torch.zeros_like(
             self.paged_kv_indptr.cpu, pin_memory=self.pin_memory

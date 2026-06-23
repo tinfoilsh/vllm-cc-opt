@@ -9,6 +9,7 @@ from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.platform_utils import prefer_pinned
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -294,7 +295,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # NOTE: Ensure all metadata tensors maintain fixed memory addresses
         # for CUDA graph compatibility.
         query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-        x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
+        x = torch.repeat_interleave(torch.arange(num_reqs), query_lens)
+        if prefer_pinned():
+            x = x.pin_memory()
         token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
         token_to_req_indices.copy_(x, non_blocking=True)
 

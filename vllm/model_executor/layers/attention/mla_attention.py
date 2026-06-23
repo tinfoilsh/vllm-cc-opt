@@ -242,6 +242,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer
 from vllm.utils.math_utils import cdiv, round_down
+from vllm.utils.platform_utils import prefer_pinned
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -1671,7 +1672,10 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 chunk_seq_lens = (chunk_ends - chunk_starts).clamp(min=0)
 
                 cu_seq_lens_cpu = torch.zeros(
-                    num_chunks, num_prefills + 1, dtype=torch.int32, pin_memory=True
+                    num_chunks,
+                    num_prefills + 1,
+                    dtype=torch.int32,
+                    pin_memory=prefer_pinned(),
                 )
                 torch.cumsum(
                     chunk_seq_lens, dim=1, out=cu_seq_lens_cpu[:, 1:], dtype=torch.int32
@@ -1735,7 +1739,10 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                     ).clamp(min=0)
 
                     padded_local_cu_chunk_seq_lens_cpu = torch.zeros(
-                        num_chunks, num_prefills + 1, dtype=torch.int32, pin_memory=True
+                        num_chunks,
+                        num_prefills + 1,
+                        dtype=torch.int32,
+                        pin_memory=prefer_pinned(),
                     )
                     torch.cumsum(
                         padded_local_chunk_seq_lens,

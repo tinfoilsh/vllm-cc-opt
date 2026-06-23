@@ -749,6 +749,11 @@ class Platform:
         return CpuArchEnum.OTHER if machine else CpuArchEnum.UNKNOWN
 
     @classmethod
+    def is_confidential_compute_enabled(cls) -> bool:
+        """Whether the platform is running under confidential compute."""
+        return False
+
+    @classmethod
     def is_pin_memory_available(cls) -> bool:
         """Checks whether pin memory is available on the current platform."""
         if in_wsl():

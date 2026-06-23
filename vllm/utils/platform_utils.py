@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import multiprocessing
+import os
 from collections.abc import Sequence
 from concurrent.futures.process import ProcessPoolExecutor
 from functools import cache
@@ -44,6 +45,26 @@ def is_pin_memory_available() -> bool:
     from vllm.platforms import current_platform
 
     return current_platform.is_pin_memory_available()
+
+
+@cache
+def prefer_pinned() -> bool:
+    """Policy for discretionary host staging buffers.
+
+    ``is_pin_memory_available`` reports capability. This reports desirability:
+    under confidential compute, small host/device copies use an encrypted
+    bounce path, so pinned memory does not buy the normal async-DMA behavior.
+    ``VLLM_CC_PAGEABLE_H2D=1`` forces the policy off for measurement.
+    """
+    if os.environ.get("VLLM_CC_PAGEABLE_H2D", "0") == "1":
+        return False
+
+    if not is_pin_memory_available():
+        return False
+
+    from vllm.platforms import current_platform
+
+    return not current_platform.is_confidential_compute_enabled()
 
 
 @cache
