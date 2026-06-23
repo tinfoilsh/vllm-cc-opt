@@ -1387,7 +1387,7 @@ class GPUModelRunner(
             return False
         if self.check_ep_fault:
             return False
-        if self.input_batch.sampling_metadata.output_token_ids:
+        if self.input_batch.sampling_metadata.requires_cpu_output_token_history:
             logger.info_once(
                 "VLLM_CC_OUTPUT_WORKER falling back to stock output copy because "
                 "sampling metadata needs CPU-visible output token ids."
@@ -5212,7 +5212,7 @@ class GPUModelRunner(
         # we only copy when needed for structured output, penalties or bad_words.
         if self.use_async_scheduling and not (
             scheduler_output.has_structured_output_requests
-            or self.input_batch.sampling_metadata.output_token_ids
+            or self.input_batch.sampling_metadata.requires_cpu_output_token_history
         ):
             return
         # We must also set the corresponding request ids.
@@ -6535,6 +6535,7 @@ class GPUModelRunner(
             presence_penalties=dummy_tensors(0.1),
             repetition_penalties=dummy_tensors(0.1),
             output_token_ids=[[] for _ in range(num_reqs)],
+            requires_cpu_output_token_history=False,
             spec_token_ids=[[] for _ in range(num_reqs)],
             allowed_token_ids_mask=None,
             bad_words_token_ids={},
