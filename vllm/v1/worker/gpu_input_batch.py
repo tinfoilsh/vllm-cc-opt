@@ -903,16 +903,7 @@ class InputBatch:
 
         # Only set output_token_ids if required by the current requests'
         # sampling parameters.
-        holder = self.thinking_budget_state_holder
-        thinking_budget_tracks_reqs = (
-            holder is not None and holder.has_tracked_requests()
-        )
-        needs_output_token_ids = (
-            not self.no_penalties
-            or bool(self.bad_words_token_ids)
-            or self.logitsprocs_need_output_token_ids
-            or thinking_budget_tracks_reqs
-        )
+        needs_output_token_ids = self.requires_cpu_output_token_history()
         output_token_ids = (
             cast(list[list[int]], self.req_output_token_ids)
             if needs_output_token_ids
@@ -952,6 +943,7 @@ class InputBatch:
             presence_penalties=self.presence_penalties[:num_reqs],
             repetition_penalties=self.repetition_penalties[:num_reqs],
             output_token_ids=output_token_ids,
+            requires_cpu_output_token_history=needs_output_token_ids,
             spec_token_ids=self.spec_token_ids,
             no_penalties=self.no_penalties,
             allowed_token_ids_mask=allowed_token_ids_mask,
@@ -981,6 +973,18 @@ class InputBatch:
             prompt_token_ids_cpu=prompt_token_ids_cpu,
             pooling_params=pooling_params,
             pooling_states=pooling_states,
+        )
+
+    def requires_cpu_output_token_history(self) -> bool:
+        holder = self.thinking_budget_state_holder
+        thinking_budget_tracks_reqs = (
+            holder is not None and holder.has_tracked_requests()
+        )
+        return (
+            not self.no_penalties
+            or bool(self.bad_words_token_ids)
+            or self.logitsprocs_need_output_token_ids
+            or thinking_budget_tracks_reqs
         )
 
     def _make_prompt_token_ids_cpu_tensor(self) -> torch.Tensor:
@@ -1035,7 +1039,7 @@ class InputBatch:
         tensor and corresponding copy-ready event. Used to repair
         output_token_ids prior to sampling, if needed by logits processors.
         """
-        if self.sampling_metadata.output_token_ids:
+        if self.sampling_metadata.requires_cpu_output_token_history:
             self.sampled_token_ids_cpu = sampled_token_ids_cpu
             self.async_copy_ready_event = async_copy_ready_event
         else:
