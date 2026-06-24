@@ -30,6 +30,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.v1.ccbench_instrumentation import ccbench_instant
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -946,6 +947,20 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
         )
+        if self.num_spec_tokens > 0:
+            ccbench_instant(
+                "ccbench.spec.scheduler.schedule",
+                {
+                    "num_scheduled_reqs": len(num_scheduled_tokens),
+                    "total_num_scheduled_tokens": total_num_scheduled_tokens,
+                    "num_spec_reqs": len(scheduled_spec_decode_tokens),
+                    "total_scheduled_spec_tokens": sum(
+                        len(tokens) for tokens in scheduled_spec_decode_tokens.values()
+                    ),
+                    "num_new_reqs": len(new_reqs_data),
+                    "num_preempted_reqs": len(preempted_reqs),
+                },
+            )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -1390,6 +1405,10 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        spec_acceptance_reqs = 0
+        spec_acceptance_draft_total = 0
+        spec_acceptance_accepted_total = 0
+        spec_acceptance_rejected_total = 0
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
@@ -1429,6 +1448,10 @@ class Scheduler(SchedulerInterface):
                 # the scheduled spec tokens count and so is similarly adjusted.
                 if request.num_output_placeholders > 0:
                     request.num_output_placeholders -= num_rejected
+                spec_acceptance_reqs += 1
+                spec_acceptance_draft_total += num_draft_tokens
+                spec_acceptance_accepted_total += num_accepted
+                spec_acceptance_rejected_total += num_rejected
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
@@ -1570,6 +1593,18 @@ class Scheduler(SchedulerInterface):
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
+
+        if spec_acceptance_reqs:
+            ccbench_instant(
+                "ccbench.spec.scheduler.acceptance",
+                {
+                    "num_reqs": spec_acceptance_reqs,
+                    "draft_tokens": spec_acceptance_draft_total,
+                    "accepted_tokens": spec_acceptance_accepted_total,
+                    "rejected_tokens": spec_acceptance_rejected_total,
+                    "num_invalid_spec_tokens": scheduler_output.num_invalid_spec_tokens,
+                },
+            )
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:

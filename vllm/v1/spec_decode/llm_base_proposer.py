@@ -29,6 +29,11 @@ from vllm.utils.platform_utils import prefer_pinned
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
+from vllm.v1.ccbench_instrumentation import (
+    ccbench_span,
+    tensor_nbytes,
+    tensor_shape,
+)
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -468,21 +473,42 @@ class SpecDecodeBaseProposer:
             )
             assert target_hidden_states.shape[-1] == self.hidden_size
 
-        num_tokens, token_indices_to_sample, common_attn_metadata = (
-            self.set_inputs_first_pass(
-                target_token_ids=target_token_ids,
-                next_token_ids=next_token_ids,
-                target_positions=target_positions,
-                target_hidden_states=target_hidden_states,
-                token_indices_to_sample=token_indices_to_sample,
-                cad=common_attn_metadata,
-                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+        with ccbench_span(
+            "ccbench.spec.draft.set_inputs_first_pass",
+            {
+                "method": self.method,
+                "batch_size": batch_size,
+                "target_token_ids_shape": tensor_shape(target_token_ids),
+                "target_hidden_states_shape": tensor_shape(target_hidden_states),
+                "next_token_ids_shape": tensor_shape(next_token_ids),
+                "needs_extra_input_slots": self.needs_extra_input_slots,
+                "parallel_drafting": self.parallel_drafting,
+            },
+        ):
+            num_tokens, token_indices_to_sample, common_attn_metadata = (
+                self.set_inputs_first_pass(
+                    target_token_ids=target_token_ids,
+                    next_token_ids=next_token_ids,
+                    target_positions=target_positions,
+                    target_hidden_states=target_hidden_states,
+                    token_indices_to_sample=token_indices_to_sample,
+                    cad=common_attn_metadata,
+                    num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                )
             )
-        )
 
-        per_group_attn_metadata, per_layer_attn_metadata = (
-            self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
-        )
+        with ccbench_span(
+            "ccbench.spec.draft.attn_metadata.first_pass",
+            {
+                "method": self.method,
+                "batch_size": batch_size,
+                "num_tokens": num_tokens,
+                "num_draft_attn_groups": len(self.draft_attn_groups),
+            },
+        ):
+            per_group_attn_metadata, per_layer_attn_metadata = (
+                self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
+            )
 
         cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
             self._determine_batch_execution_and_padding(num_tokens)
@@ -497,22 +523,34 @@ class SpecDecodeBaseProposer:
         if self._share_mtp_indices and hasattr(self.model.model, "set_skip_topk"):
             self.model.model.set_skip_topk(False)
 
-        with set_forward_context(
-            per_layer_attn_metadata,
-            self.vllm_config,
-            num_tokens=num_input_tokens,
-            num_tokens_across_dp=num_tokens_across_dp,
-            cudagraph_runtime_mode=cudagraph_runtime_mode,
-            slot_mapping=self._get_slot_mapping(
-                slot_mapping_size, common_attn_metadata.slot_mapping
-            ),
+        with ccbench_span(
+            "ccbench.spec.draft.forward.first_pass",
+            {
+                "method": self.method,
+                "batch_size": batch_size,
+                "num_tokens": num_tokens,
+                "num_input_tokens": num_input_tokens,
+                "num_tokens_across_dp": num_tokens_across_dp,
+                "cudagraph_runtime_mode": str(cudagraph_runtime_mode),
+                "slot_mapping_size": slot_mapping_size,
+            },
         ):
-            ret_hidden_states = self.model(**model_kwargs)
-            if not self.model_returns_tuple():
-                last_hidden_states = ret_hidden_states
-                hidden_states = last_hidden_states
-            else:
-                last_hidden_states, hidden_states = ret_hidden_states
+            with set_forward_context(
+                per_layer_attn_metadata,
+                self.vllm_config,
+                num_tokens=num_input_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
+                slot_mapping=self._get_slot_mapping(
+                    slot_mapping_size, common_attn_metadata.slot_mapping
+                ),
+            ):
+                ret_hidden_states = self.model(**model_kwargs)
+                if not self.model_returns_tuple():
+                    last_hidden_states = ret_hidden_states
+                    hidden_states = last_hidden_states
+                else:
+                    last_hidden_states, hidden_states = ret_hidden_states
 
         # After step 0: switch to reuse mode so steps 1+ skip the indexer
         # and read the indices that step 0 just wrote into the shared buffer.
@@ -604,11 +642,20 @@ class SpecDecodeBaseProposer:
             # (e.g. Gemma4 MTP), common_attn_metadata is invariant across
             # loop iterations so we build once and reuse.
             if not self.constant_draft_positions or token_index == 0:
-                _, per_layer_attn_metadata = (
-                    self.build_per_group_and_layer_attn_metadata(
-                        common_attn_metadata, draft_index=token_index + 1
+                with ccbench_span(
+                    "ccbench.spec.draft.attn_metadata.loop",
+                    {
+                        "method": self.method,
+                        "batch_size": batch_size,
+                        "draft_index": token_index + 1,
+                        "constant_draft_positions": self.constant_draft_positions,
+                    },
+                ):
+                    _, per_layer_attn_metadata = (
+                        self.build_per_group_and_layer_attn_metadata(
+                            common_attn_metadata, draft_index=token_index + 1
+                        )
                     )
-                )
 
             # copy inputs to buffer for cudagraph
             self.input_ids[:batch_size] = input_ids
@@ -631,20 +678,32 @@ class SpecDecodeBaseProposer:
             if self.pass_hidden_states_to_model:
                 model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
 
-            with set_forward_context(
-                per_layer_attn_metadata,
-                self.vllm_config,
-                num_tokens=input_batch_size,
-                num_tokens_across_dp=batch_size_across_dp,
-                cudagraph_runtime_mode=cudagraph_runtime_mode,
-                slot_mapping=self._get_slot_mapping(input_batch_size),
+            with ccbench_span(
+                "ccbench.spec.draft.forward.loop",
+                {
+                    "method": self.method,
+                    "batch_size": batch_size,
+                    "draft_index": token_index + 1,
+                    "input_batch_size": input_batch_size,
+                    "batch_size_across_dp": batch_size_across_dp,
+                    "constant_draft_positions": self.constant_draft_positions,
+                    "cudagraph_runtime_mode": str(cudagraph_runtime_mode),
+                },
             ):
-                ret_hidden_states = self.model(**model_kwargs)
-                if not self.model_returns_tuple():
-                    last_hidden_states = ret_hidden_states
-                    hidden_states = ret_hidden_states
-                else:
-                    last_hidden_states, hidden_states = ret_hidden_states
+                with set_forward_context(
+                    per_layer_attn_metadata,
+                    self.vllm_config,
+                    num_tokens=input_batch_size,
+                    num_tokens_across_dp=batch_size_across_dp,
+                    cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    slot_mapping=self._get_slot_mapping(input_batch_size),
+                ):
+                    ret_hidden_states = self.model(**model_kwargs)
+                    if not self.model_returns_tuple():
+                        last_hidden_states = ret_hidden_states
+                        hidden_states = ret_hidden_states
+                    else:
+                        last_hidden_states, hidden_states = ret_hidden_states
 
             hidden_states = hidden_states[:batch_size]
             draft_token_ids, draft_probs = self._sample_draft_tokens(
@@ -944,11 +1003,23 @@ class SpecDecodeBaseProposer:
         """
         # Precompute backup token IDs for discarded requests.
         num_reqs = gpu_input_batch.num_reqs
-        for i in range(num_reqs):
-            self.backup_next_token_ids.np[i] = requests[
-                gpu_input_batch.req_ids[i]
-            ].get_token_id(gpu_input_batch.num_tokens_no_spec[i] - 1)
-        self.backup_next_token_ids.copy_to_gpu(num_reqs)
+        with ccbench_span(
+            "ccbench.spec.draft.prepare_next_token_ids.backup_h2d",
+            {
+                "method": self.method,
+                "num_reqs": num_reqs,
+                "backup_next_token_ids_bytes": int(
+                    num_reqs * self.backup_next_token_ids.gpu.element_size()
+                ),
+                "sampled_token_ids_shape": tensor_shape(sampled_token_ids),
+                "sampled_token_ids_bytes": tensor_nbytes(sampled_token_ids),
+            },
+        ):
+            for i in range(num_reqs):
+                self.backup_next_token_ids.np[i] = requests[
+                    gpu_input_batch.req_ids[i]
+                ].get_token_id(gpu_input_batch.num_tokens_no_spec[i] - 1)
+            self.backup_next_token_ids.copy_to_gpu(num_reqs)
         backup_tokens_gpu = self.backup_next_token_ids.gpu
 
         batch_size, num_tokens = sampled_token_ids.shape
@@ -965,18 +1036,27 @@ class SpecDecodeBaseProposer:
 
         # Find the next power of 2 for block sizes
         BLOCK_SIZE_TOKENS = next_power_of_2(num_tokens)
-        eagle_prepare_next_token_padded_kernel[grid](
-            sampled_token_ids,
-            discard_request_mask,
-            backup_tokens_gpu,
-            next_token_ids,
-            valid_sampled_tokens_count,
-            gpu_input_batch.vocab_size,
-            num_tokens,
-            batch_size,
-            sampled_token_ids.stride(0),
-            BLOCK_SIZE_TOKENS=BLOCK_SIZE_TOKENS,
-        )
+        with ccbench_span(
+            "ccbench.spec.draft.prepare_next_token_ids.kernel",
+            {
+                "method": self.method,
+                "batch_size": batch_size,
+                "num_tokens": num_tokens,
+                "block_size_tokens": BLOCK_SIZE_TOKENS,
+            },
+        ):
+            eagle_prepare_next_token_padded_kernel[grid](
+                sampled_token_ids,
+                discard_request_mask,
+                backup_tokens_gpu,
+                next_token_ids,
+                valid_sampled_tokens_count,
+                gpu_input_batch.vocab_size,
+                num_tokens,
+                batch_size,
+                sampled_token_ids.stride(0),
+                BLOCK_SIZE_TOKENS=BLOCK_SIZE_TOKENS,
+            )
 
         return next_token_ids, valid_sampled_tokens_count
 
@@ -1005,36 +1085,60 @@ class SpecDecodeBaseProposer:
         )
 
         grid = (num_reqs,)
-        eagle_prepare_inputs_padded_kernel[grid](
-            spec_decode_metadata.cu_num_draft_tokens,
-            valid_sampled_tokens_count,
-            common_attn_metadata.query_start_loc,
-            token_indices_to_sample,
-            num_rejected_tokens_gpu,
-            num_reqs,
-        )
+        with ccbench_span(
+            "ccbench.spec.draft.prepare_inputs_padded.kernel",
+            {
+                "method": self.method,
+                "num_reqs": num_reqs,
+                "sum_num_draft_tokens": sum(spec_decode_metadata.num_draft_tokens),
+                "valid_sampled_count_shape": tensor_shape(
+                    valid_sampled_tokens_count
+                ),
+                "query_start_loc_shape": tensor_shape(
+                    common_attn_metadata.query_start_loc
+                ),
+            },
+        ):
+            eagle_prepare_inputs_padded_kernel[grid](
+                spec_decode_metadata.cu_num_draft_tokens,
+                valid_sampled_tokens_count,
+                common_attn_metadata.query_start_loc,
+                token_indices_to_sample,
+                num_rejected_tokens_gpu,
+                num_reqs,
+            )
 
-        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-        new_query_len_per_req = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        with ccbench_span(
+            "ccbench.spec.draft.prepare_inputs_padded.cpu_metadata",
+            {
+                "method": self.method,
+                "num_reqs": num_reqs,
+                "query_start_loc_cpu_len": len(
+                    common_attn_metadata.query_start_loc_cpu
+                ),
+            },
+        ):
+            query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+            new_query_len_per_req = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
 
-        total_num_tokens = query_start_loc_cpu[-1].item()
+            total_num_tokens = query_start_loc_cpu[-1].item()
 
-        spec_common_attn_metadata = CommonAttentionMetadata(
-            query_start_loc=common_attn_metadata.query_start_loc,
-            seq_lens=common_attn_metadata.seq_lens,
-            query_start_loc_cpu=query_start_loc_cpu,
-            _seq_lens_cpu=common_attn_metadata._seq_lens_cpu,
-            _num_computed_tokens_cpu=common_attn_metadata._num_computed_tokens_cpu,
-            seq_lens_cpu_upper_bound=common_attn_metadata.seq_lens_cpu_upper_bound,
-            num_reqs=common_attn_metadata.num_reqs,
-            num_actual_tokens=total_num_tokens,
-            max_query_len=new_query_len_per_req.max().item(),
-            max_seq_len=common_attn_metadata.max_seq_len,
-            block_table_tensor=common_attn_metadata.block_table_tensor,
-            slot_mapping=common_attn_metadata.slot_mapping[:total_num_tokens],
-            causal=True,
-            dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
-        )
+            spec_common_attn_metadata = CommonAttentionMetadata(
+                query_start_loc=common_attn_metadata.query_start_loc,
+                seq_lens=common_attn_metadata.seq_lens,
+                query_start_loc_cpu=query_start_loc_cpu,
+                _seq_lens_cpu=common_attn_metadata._seq_lens_cpu,
+                _num_computed_tokens_cpu=common_attn_metadata._num_computed_tokens_cpu,
+                seq_lens_cpu_upper_bound=common_attn_metadata.seq_lens_cpu_upper_bound,
+                num_reqs=common_attn_metadata.num_reqs,
+                num_actual_tokens=total_num_tokens,
+                max_query_len=new_query_len_per_req.max().item(),
+                max_seq_len=common_attn_metadata.max_seq_len,
+                block_table_tensor=common_attn_metadata.block_table_tensor,
+                slot_mapping=common_attn_metadata.slot_mapping[:total_num_tokens],
+                causal=True,
+                dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
+            )
 
         return (
             spec_common_attn_metadata,

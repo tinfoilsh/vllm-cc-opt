@@ -12,6 +12,13 @@ import torch.nn as nn
 
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+from vllm.v1.ccbench_instrumentation import (
+    ccbench_span,
+    safe_len,
+    safe_sum,
+    tensor_nbytes,
+    tensor_shape,
+)
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
 from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -86,6 +93,47 @@ class RejectionSampler(nn.Module):
         self.synthetic_mode = self.synthetic_conditional_rates is not None
 
     def forward(
+        self,
+        metadata: SpecDecodeMetadata,
+        # [num_tokens, vocab_size]
+        draft_probs: torch.Tensor | None,
+        # [num_tokens + batch_size, vocab_size]
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> SamplerOutput:
+        holder = sampling_metadata.thinking_budget_state_holder
+        with ccbench_span(
+            "ccbench.spec.rejection.forward",
+            {
+                "num_reqs": len(metadata.num_draft_tokens),
+                "sum_num_draft_tokens": safe_sum(metadata.num_draft_tokens),
+                "max_spec_len": metadata.max_spec_len,
+                "has_draft_probs": draft_probs is not None,
+                "logits_shape": tensor_shape(logits),
+                "logits_bytes": tensor_nbytes(logits),
+                "has_logprobs": sampling_metadata.max_num_logprobs is not None,
+                "has_penalties": not sampling_metadata.no_penalties,
+                "has_bad_words": bool(sampling_metadata.bad_words_token_ids),
+                "has_thinking": holder is not None
+                and holder.has_tracked_requests(),
+                "has_allowed_token_ids": sampling_metadata.allowed_token_ids_mask
+                is not None,
+                "num_logits_processors": safe_len(
+                    sampling_metadata.logitsprocs.non_argmax_invariant
+                ),
+                "synthetic_mode": self.synthetic_mode,
+                "all_greedy": sampling_metadata.all_greedy,
+                "all_random": sampling_metadata.all_random,
+            },
+        ):
+            return self._forward_impl(
+                metadata,
+                draft_probs,
+                logits,
+                sampling_metadata,
+            )
+
+    def _forward_impl(
         self,
         metadata: SpecDecodeMetadata,
         # [num_tokens, vocab_size]
@@ -264,23 +312,34 @@ class RejectionSampler(nn.Module):
         Returns:
             A list of lists of token IDs.
         """
-        output_token_ids_np = output_token_ids.cpu().numpy()
-        # Create mask for valid tokens.
-        valid_mask = (output_token_ids_np != PLACEHOLDER_TOKEN_ID) & (
-            output_token_ids_np < vocab_size
-        )
-        output_logprobs = None
-        if logprobs_tensors is not None:
-            cu_num_tokens = [0] + valid_mask.sum(axis=1).cumsum().tolist()
-            filtered_tensors = logprobs_tensors.filter(valid_mask.flatten())
-            output_logprobs = filtered_tensors.tolists(cu_num_tokens)
+        with ccbench_span(
+            "ccbench.spec.rejection.parse_output",
+            {
+                "output_token_ids_bytes": tensor_nbytes(output_token_ids),
+                "output_token_ids_shape": tensor_shape(output_token_ids),
+                "vocab_size": vocab_size,
+                "discard_req_indices": len(discard_req_indices),
+                "has_logprobs": logprobs_tensors is not None,
+            },
+        ):
+            output_token_ids_np = output_token_ids.cpu().numpy()
+            # Create mask for valid tokens.
+            valid_mask = (output_token_ids_np != PLACEHOLDER_TOKEN_ID) & (
+                output_token_ids_np < vocab_size
+            )
+            output_logprobs = None
+            if logprobs_tensors is not None:
+                cu_num_tokens = [0] + valid_mask.sum(axis=1).cumsum().tolist()
+                filtered_tensors = logprobs_tensors.filter(valid_mask.flatten())
+                output_logprobs = filtered_tensors.tolists(cu_num_tokens)
 
-        if len(discard_req_indices) > 0:
-            valid_mask[discard_req_indices] = False
-        outputs = [
-            row[valid_mask[i]].tolist() for i, row in enumerate(output_token_ids_np)
-        ]
-        return outputs, output_logprobs
+            if len(discard_req_indices) > 0:
+                valid_mask[discard_req_indices] = False
+            outputs = [
+                row[valid_mask[i]].tolist()
+                for i, row in enumerate(output_token_ids_np)
+            ]
+            return outputs, output_logprobs
 
     def apply_logits_processors(
         self,
@@ -311,15 +370,34 @@ class RejectionSampler(nn.Module):
         )
         if need_repeat_indices:
             num_requests = len(metadata.num_draft_tokens)
-            num_draft_tokens = torch.tensor(metadata.num_draft_tokens, device="cpu")
-            original_indices = torch.arange(num_requests, device="cpu")
-            repeat_indices_cpu = original_indices.repeat_interleave(num_draft_tokens)
-            repeat_indices = repeat_indices_cpu.to(
-                device=logits.device, non_blocking=True
-            )
-            logits = self.apply_penalties(
-                logits, sampling_metadata, metadata, repeat_indices, output_token_ids
-            )
+            with ccbench_span(
+                "ccbench.spec.rejection.repeat_indices_h2d",
+                {
+                    "num_reqs": num_requests,
+                    "sum_num_draft_tokens": safe_sum(metadata.num_draft_tokens),
+                    "has_penalties": has_penalties,
+                    "has_thinking": needs_thinking,
+                    "has_allowed_token_ids": sampling_metadata.allowed_token_ids_mask
+                    is not None,
+                },
+            ):
+                num_draft_tokens = torch.tensor(
+                    metadata.num_draft_tokens, device="cpu"
+                )
+                original_indices = torch.arange(num_requests, device="cpu")
+                repeat_indices_cpu = original_indices.repeat_interleave(
+                    num_draft_tokens
+                )
+                repeat_indices = repeat_indices_cpu.to(
+                    device=logits.device, non_blocking=True
+                )
+                logits = self.apply_penalties(
+                    logits,
+                    sampling_metadata,
+                    metadata,
+                    repeat_indices,
+                    output_token_ids,
+                )
 
             # Apply allowed token ids.
             if sampling_metadata.allowed_token_ids_mask is not None:
@@ -328,21 +406,49 @@ class RejectionSampler(nn.Module):
 
         # Apply bad words exclusion.
         if bad_words_token_ids := sampling_metadata.bad_words_token_ids:
-            apply_bad_words_with_drafts(
-                logits, bad_words_token_ids, output_token_ids, metadata.num_draft_tokens
-            )
-
-        for processor in sampling_metadata.logitsprocs.non_argmax_invariant:
-            if isinstance(processor, MinTokensLogitsProcessor):
-                logits = processor.apply_with_spec_decode(
-                    logits, metadata.num_draft_tokens
+            with ccbench_span(
+                "ccbench.spec.rejection.bad_words",
+                {
+                    "num_reqs": len(metadata.num_draft_tokens),
+                    "sum_num_draft_tokens": safe_sum(metadata.num_draft_tokens),
+                    "num_bad_word_lists": len(bad_words_token_ids),
+                },
+            ):
+                apply_bad_words_with_drafts(
+                    logits,
+                    bad_words_token_ids,
+                    output_token_ids,
+                    metadata.num_draft_tokens,
                 )
+
+        processors = sampling_metadata.logitsprocs.non_argmax_invariant
+        if processors:
+            with ccbench_span(
+                "ccbench.spec.rejection.logits_processors",
+                {
+                    "num_processors": len(processors),
+                    "num_reqs": len(metadata.num_draft_tokens),
+                    "sum_num_draft_tokens": safe_sum(metadata.num_draft_tokens),
+                },
+            ):
+                for processor in processors:
+                    if isinstance(processor, MinTokensLogitsProcessor):
+                        logits = processor.apply_with_spec_decode(
+                            logits, metadata.num_draft_tokens
+                        )
         if holder is not None and holder.has_tracked_requests():
-            logits = holder.apply_to_logits(
-                logits,
-                predict_bonus_token=False,
-                spec_token_ids=sampling_metadata.spec_token_ids,
-            )
+            with ccbench_span(
+                "ccbench.spec.rejection.thinking_budget",
+                {
+                    "num_reqs": len(metadata.num_draft_tokens),
+                    "sum_num_draft_tokens": safe_sum(metadata.num_draft_tokens),
+                },
+            ):
+                logits = holder.apply_to_logits(
+                    logits,
+                    predict_bonus_token=False,
+                    spec_token_ids=sampling_metadata.spec_token_ids,
+                )
         return logits
 
     @staticmethod

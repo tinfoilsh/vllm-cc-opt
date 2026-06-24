@@ -17,6 +17,11 @@ from vllm.config import VllmConfig, get_layers_from_vllm_config, replace
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.ccbench_instrumentation import (
+    ccbench_instant,
+    ccbench_span,
+    tensor_shape,
+)
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
@@ -79,38 +84,62 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
         common_attn_metadata whose block_table belongs to one group.
         We swap in the correct block table for each draft attention group.
         """
-        per_group_attn_metadata: list[object] = []
-        per_layer_attn_metadata: dict[str, object] = {}
         batch_size = common_attn_metadata.batch_size()
-        for attn_group in self.draft_attn_groups:
-            gid = attn_group.kv_cache_group_id
-            if gid in self._per_group_block_tables:
-                cm = copy(common_attn_metadata)
-                # Slice to actual batch size to match cu_seqlens_q dimension.
-                # The stored block tables may be padded (num_reqs_padded) from
-                # the target forward pass, but the drafter operates on the
-                # unpadded batch.
-                cm.block_table_tensor = self._per_group_block_tables[gid][:batch_size]
-            else:
-                cm = common_attn_metadata
-            attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
-                common_attn_metadata=cm, draft_index=draft_index
-            )
-            per_group_attn_metadata.append(attn_metadata)
-            for layer_name in attn_group.layer_names:
-                per_layer_attn_metadata[layer_name] = attn_metadata
-        return per_group_attn_metadata, per_layer_attn_metadata
+        with ccbench_span(
+            "ccbench.spec.gemma4.attn_metadata",
+            {
+                "draft_index": draft_index,
+                "batch_size": batch_size,
+                "num_draft_attn_groups": len(self.draft_attn_groups),
+                "num_per_group_block_tables": len(self._per_group_block_tables),
+                "query_start_loc_shape": tensor_shape(
+                    common_attn_metadata.query_start_loc
+                ),
+                "block_table_shape": tensor_shape(
+                    common_attn_metadata.block_table_tensor
+                ),
+            },
+        ):
+            per_group_attn_metadata: list[object] = []
+            per_layer_attn_metadata: dict[str, object] = {}
+            for attn_group in self.draft_attn_groups:
+                gid = attn_group.kv_cache_group_id
+                if gid in self._per_group_block_tables:
+                    cm = copy(common_attn_metadata)
+                    # Slice to actual batch size to match cu_seqlens_q dimension.
+                    # The stored block tables may be padded (num_reqs_padded) from
+                    # the target forward pass, but the drafter operates on the
+                    # unpadded batch.
+                    cm.block_table_tensor = self._per_group_block_tables[gid][
+                        :batch_size
+                    ]
+                else:
+                    cm = common_attn_metadata
+                attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
+                    common_attn_metadata=cm, draft_index=draft_index
+                )
+                per_group_attn_metadata.append(attn_metadata)
+                for layer_name in attn_group.layer_names:
+                    per_layer_attn_metadata[layer_name] = attn_metadata
+            return per_group_attn_metadata, per_layer_attn_metadata
 
     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self._centroids_sizes:
-            T = hidden_states.shape[0]
-            for size in self._centroids_sizes:
-                if size >= T:
-                    self._centroids_inputs[size][:T].copy_(hidden_states)
-                    self._centroids_graphs[size].replay()
-                    return self._centroids_outputs[size][:T].clone()
-            return self.model.get_top_tokens(hidden_states)
-        return super()._greedy_sample(hidden_states)
+        with ccbench_span(
+            "ccbench.spec.gemma4.greedy_sample",
+            {
+                "hidden_states_shape": tensor_shape(hidden_states),
+                "centroids_graph_count": len(self._centroids_sizes),
+            },
+        ):
+            if self._centroids_sizes:
+                T = hidden_states.shape[0]
+                for size in self._centroids_sizes:
+                    if size >= T:
+                        self._centroids_inputs[size][:T].copy_(hidden_states)
+                        self._centroids_graphs[size].replay()
+                        return self._centroids_outputs[size][:T].clone()
+                return self.model.get_top_tokens(hidden_states)
+            return super()._greedy_sample(hidden_states)
 
     def _setup_centroids_cuda_graphs(self) -> None:
         """Capture CUDA graphs for centroids get_top_tokens at key sizes."""
@@ -308,6 +337,7 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
                 break
 
         draft_layer_types = getattr(draft_text_config, "layer_types", [])
+        mapped_layers = 0
         for draft_idx, layer in enumerate(self.model.model.layers):
             if not hasattr(layer, "self_attn"):
                 continue
@@ -332,9 +362,20 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
             target_idx = candidates[-1]
             target_layer_name = f"{target_prefix}.{target_idx}.self_attn.attn"
             attn.kv_sharing_target_layer_name = target_layer_name
+            mapped_layers += 1
             logger.info(
                 "Gemma4 MTP: draft layer %d (%s) -> %s",
                 draft_idx,
                 draft_layer_type,
                 target_layer_name,
             )
+        ccbench_instant(
+            "ccbench.spec.gemma4.kv_sharing",
+            {
+                "mapped_layers": mapped_layers,
+                "draft_layers": len(getattr(self.model.model, "layers", [])),
+                "target_num_kv_shared": target_num_kv_shared,
+                "target_layer_types": sorted(set(target_layer_types)),
+                "draft_layer_types": sorted(set(draft_layer_types)),
+            },
+        )
