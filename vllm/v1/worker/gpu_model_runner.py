@@ -1031,6 +1031,9 @@ class GPUModelRunner(
         if self.cc_output_worker_enabled:
             logger.info("Using experimental CC output publication worker.")
         self._cc_output_publication_worker: CCOutputPublicationWorker | None = None
+        self._cc_valid_sampled_token_count_publication: (
+            CCOutputPublication | None
+        ) = None
 
         # self.cudagraph_batch_sizes sorts in ascending order.
         if (
@@ -5132,6 +5135,7 @@ class GPUModelRunner(
         self._draft_probs = None
         self._draft_prob_req_ids = None
         self._draft_token_req_ids = None
+        self._cc_valid_sampled_token_count_publication = None
         self.valid_sampled_token_count_gpu = None
         self.input_batch.prev_sampled_token_ids = None
 
@@ -5339,15 +5343,18 @@ class GPUModelRunner(
 
             if num_nans_device is None and self._can_use_cc_output_worker():
                 worker = self._get_or_create_cc_output_publication_worker()
+                publication = worker.submit(
+                    sampled_token_ids=sampler_output.sampled_token_ids,
+                    logprobs_tensors=sampler_output.logprobs_tensors,
+                    routed_experts=routed_experts_snapshot,
+                    invalid_req_indices=invalid_req_indices,
+                    vocab_size=self.input_batch.vocab_size,
+                )
+                if self.use_async_spec_decode:
+                    self._cc_valid_sampled_token_count_publication = publication
                 async_output = AsyncGPUWorkerModelRunnerOutput(
                     model_runner_output=output,
-                    publication=worker.submit(
-                        sampled_token_ids=sampler_output.sampled_token_ids,
-                        logprobs_tensors=sampler_output.logprobs_tensors,
-                        routed_experts=routed_experts_snapshot,
-                        invalid_req_indices=invalid_req_indices,
-                        vocab_size=self.input_batch.vocab_size,
-                    ),
+                    publication=publication,
                 )
                 self.input_batch.sampled_token_ids_cpu = None
                 self.input_batch.async_copy_ready_event = None
@@ -5485,6 +5492,11 @@ class GPUModelRunner(
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
     ) -> None:
+        if self.use_async_spec_decode and self._can_use_cc_output_worker():
+            self.valid_sampled_token_count_gpu = valid_sampled_tokens_count
+            self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
+            return
+
         if self.valid_sampled_token_count_event is None:
             return
 
@@ -5507,6 +5519,13 @@ class GPUModelRunner(
     def _get_valid_sampled_token_count(self) -> list[int]:
         # Wait until valid_sampled_tokens_count is copied to cpu,
         prev_sampled_token_ids = self.input_batch.prev_sampled_token_ids
+        if (
+            prev_sampled_token_ids is not None
+            and self._cc_valid_sampled_token_count_publication is not None
+        ):
+            result = self._cc_valid_sampled_token_count_publication.result()
+            return [len(tokens) for tokens in result.sampled_token_ids]
+
         sampled_count_event = self.valid_sampled_token_count_event
         if sampled_count_event is None or prev_sampled_token_ids is None:
             return []
