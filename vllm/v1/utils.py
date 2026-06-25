@@ -117,7 +117,10 @@ class CpuGpuBuffer:
         device: torch.device,
         pin_memory: bool = PIN_MEMORY,
         with_numpy: bool = True,
+        buffer_name: str | None = None,
     ) -> None:
+        self.buffer_name = buffer_name
+        self.pin_memory = pin_memory
         # these buffers are mutable runtime state, so allocate them as normal
         with torch.inference_mode(False):
             self.cpu = torch.zeros(

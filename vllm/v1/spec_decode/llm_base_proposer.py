@@ -245,6 +245,7 @@ class SpecDecodeBaseProposer:
             pin_memory=PIN_MEMORY,
             device=device,
             with_numpy=True,
+            buffer_name="spec_backup_next_token_ids",
         )
         self._enable_probabilistic_draft_probs = (
             self.speculative_config.rejection_sample_method == "standard"

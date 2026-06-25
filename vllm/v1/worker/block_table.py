@@ -8,9 +8,11 @@ import torch
 
 from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.ccbench_instrumentation import ccbench_instant, ccbench_span
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
@@ -70,16 +72,48 @@ class BlockTable:
         self.max_num_blocks_per_req = max_num_blocks_per_req * self.blocks_per_kv_block
 
         self.block_table = self._make_buffer(
-            self.max_num_reqs, self.max_num_blocks_per_req, dtype=torch.int32
+            self.max_num_reqs,
+            self.max_num_blocks_per_req,
+            dtype=torch.int32,
+            name="block_table",
         )
         self.num_blocks_per_row = np.zeros(max_num_reqs, dtype=np.int32)
+        block_table_dirty_update_requested = bool(
+            int(os.environ.get("VLLM_CC_BLOCK_TABLE_DIRTY_UPDATE", "0") or "0")
+        )
+        block_table_dirty_update_cc_enabled = (
+            current_platform.is_confidential_compute_enabled()
+            if block_table_dirty_update_requested
+            else False
+        )
+        if (
+            block_table_dirty_update_requested
+            and not block_table_dirty_update_cc_enabled
+        ):
+            logger.warning_once(
+                "Ignoring VLLM_CC_BLOCK_TABLE_DIRTY_UPDATE because "
+                "confidential compute is not enabled."
+            )
+        self._block_table_dirty_update_enabled = (
+            block_table_dirty_update_requested
+            and block_table_dirty_update_cc_enabled
+        )
         self._block_table_dirty_commit_enabled = bool(
             int(os.environ.get("VLLM_CC_DECODE_METADATA_FASTPATH", "0") or "0")
+            or self._block_table_dirty_update_enabled
         )
-        self._block_table_dirty = True
+        self._block_table_dirty = False
+        self._dirty_rows: list[int] = []
+        self._dirty_starts: list[int] = []
+        self._dirty_values: list[int] = []
+        self._dirty_cu_lens: list[int] = []
+        self._dirty_packed_cpu: torch.Tensor | None = None
+        self._dirty_packed_gpu: torch.Tensor | None = None
 
         self.slot_mapping = self._make_buffer(
-            self.max_num_batched_tokens, dtype=torch.int64
+            self.max_num_batched_tokens,
+            dtype=torch.int64,
+            name="slot_mapping",
         )
 
         if self.use_hybrid_blocks:
@@ -123,6 +157,7 @@ class BlockTable:
         self.num_blocks_per_row[row_idx] += num_blocks
         self.block_table.np[row_idx, start : start + num_blocks] = block_ids
         self._block_table_dirty = True
+        self._stage_dirty_update(row_idx, start, block_ids)
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
         self.num_blocks_per_row[row_idx] = 0
@@ -134,6 +169,7 @@ class BlockTable:
         if num_blocks > 0:
             self.block_table.np[row_idx, :num_blocks] = 0
             self._block_table_dirty = True
+            self._stage_dirty_update(row_idx, 0, [0] * num_blocks)
         self.num_blocks_per_row[row_idx] = 0
 
     def move_row(self, src: int, tgt: int) -> None:
@@ -142,12 +178,18 @@ class BlockTable:
         block_table_np[tgt, :num_blocks] = block_table_np[src, :num_blocks]
         self.num_blocks_per_row[tgt] = num_blocks
         self._block_table_dirty = True
+        self._stage_dirty_update(tgt, 0, block_table_np[tgt, :num_blocks])
 
     def swap_row(self, src: int, tgt: int) -> None:
         src_tgt, tgt_src = [src, tgt], [tgt, src]
         self.num_blocks_per_row[src_tgt] = self.num_blocks_per_row[tgt_src]
         self.block_table.np[src_tgt] = self.block_table.np[tgt_src]
         self._block_table_dirty = True
+        block_table_np = self.block_table.np
+        src_blocks = self.num_blocks_per_row[src]
+        tgt_blocks = self.num_blocks_per_row[tgt]
+        self._stage_dirty_update(src, 0, block_table_np[src, :src_blocks])
+        self._stage_dirty_update(tgt, 0, block_table_np[tgt, :tgt_blocks])
 
     def compute_slot_mapping(
         self,
@@ -179,14 +221,157 @@ class BlockTable:
             self.block_table.copy_to_gpu(num_reqs)
             return
 
-        if self._block_table_dirty:
-            self.block_table.copy_to_gpu(num_reqs)
-            self._block_table_dirty = False
+        if not self._block_table_dirty:
+            return
+
+        if self._block_table_dirty_update_enabled and self._dirty_values:
+            if self._try_commit_dirty_updates(num_reqs):
+                self._block_table_dirty = False
+                return
+
+        self.block_table.copy_to_gpu(num_reqs)
+        self._clear_dirty_updates()
+        self._block_table_dirty = False
 
     def clear(self) -> None:
         self.block_table.gpu.fill_(0)
         self.block_table.cpu.fill_(0)
         self._block_table_dirty = False
+        self._clear_dirty_updates()
+
+    def _stage_dirty_update(
+        self,
+        row_idx: int,
+        start: int,
+        block_ids: list[int] | np.ndarray,
+    ) -> None:
+        if not self._block_table_dirty_update_enabled:
+            return
+        if len(block_ids) == 0:
+            return
+
+        self._dirty_rows.append(row_idx)
+        self._dirty_starts.append(start)
+        if isinstance(block_ids, np.ndarray):
+            self._dirty_values.extend(int(v) for v in block_ids.tolist())
+        else:
+            self._dirty_values.extend(int(v) for v in block_ids)
+        self._dirty_cu_lens.append(len(self._dirty_values))
+
+    def _clear_dirty_updates(self) -> None:
+        self._dirty_rows.clear()
+        self._dirty_starts.clear()
+        self._dirty_values.clear()
+        self._dirty_cu_lens.clear()
+
+    def _ensure_dirty_update_buffer(self, packed_len: int) -> None:
+        cur_len = (
+            0
+            if self._dirty_packed_cpu is None
+            else int(self._dirty_packed_cpu.numel())
+        )
+        if cur_len >= packed_len:
+            return
+
+        new_len = 1 << (packed_len - 1).bit_length()
+        self._dirty_packed_cpu = torch.empty(
+            new_len,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=self.pin_memory,
+        )
+        self._dirty_packed_gpu = torch.empty(
+            new_len,
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+    def _try_commit_dirty_updates(self, num_reqs: int) -> bool:
+        n_updates = len(self._dirty_rows)
+        n_values = len(self._dirty_values)
+        if n_updates == 0 or n_values == 0:
+            self._clear_dirty_updates()
+            return True
+
+        packed_meta_len = 3 * n_updates
+        packed_len = packed_meta_len + n_values
+        full_copy_elems = num_reqs * self.max_num_blocks_per_req
+        if packed_len >= full_copy_elems:
+            ccbench_instant(
+                "ccbench.block_table.dirty_update.fallback",
+                {
+                    "reason": "packed_not_smaller",
+                    "num_updates": n_updates,
+                    "num_values": n_values,
+                    "packed_bytes": packed_len * 4,
+                    "full_copy_bytes": full_copy_elems * 4,
+                },
+            )
+            return False
+
+        self._ensure_dirty_update_buffer(packed_len)
+        assert self._dirty_packed_cpu is not None
+        assert self._dirty_packed_gpu is not None
+        packed_cpu = self._dirty_packed_cpu[:packed_len]
+        packed_gpu = self._dirty_packed_gpu[:packed_len]
+
+        for i, (row, start, cu_len) in enumerate(
+            zip(self._dirty_rows, self._dirty_starts, self._dirty_cu_lens)
+        ):
+            offset = 3 * i
+            packed_cpu[offset] = row
+            packed_cpu[offset + 1] = start
+            packed_cpu[offset + 2] = cu_len
+        packed_cpu[packed_meta_len:packed_len] = torch.tensor(
+            self._dirty_values,
+            dtype=torch.int32,
+            device="cpu",
+        )
+
+        with ccbench_span(
+            "ccbench.metadata.copy_to_gpu",
+            {
+                "object_name": "block_table_dirty_update_packed",
+                "source": "packed_dirty_update",
+                "phase": "prepare_inputs",
+                "bytes": packed_len * 4,
+                "dtype": "torch.int32",
+                "pin_memory": self.pin_memory,
+                "num_updates": n_updates,
+                "num_values": n_values,
+                "full_copy_bytes_avoided": max(0, (full_copy_elems - packed_len) * 4),
+            },
+        ):
+            packed_gpu.copy_(packed_cpu, non_blocking=True)
+
+        with ccbench_span(
+            "ccbench.block_table.dirty_update.apply",
+            {
+                "num_updates": n_updates,
+                "num_values": n_values,
+                "packed_bytes": packed_len * 4,
+                "full_copy_bytes_avoided": max(0, (full_copy_elems - packed_len) * 4),
+            },
+        ):
+            _apply_block_table_dirty_update_kernel[(n_updates,)](
+                self.block_table.gpu,
+                self.block_table.gpu.stride(0),
+                packed_gpu,
+                packed_meta_len,
+                BLOCK_SIZE=1024,
+            )
+
+        ccbench_instant(
+            "ccbench.block_table.dirty_update.summary",
+            {
+                "num_updates": n_updates,
+                "num_values": n_values,
+                "packed_bytes": packed_len * 4,
+                "full_copy_bytes_avoided": max(0, (full_copy_elems - packed_len) * 4),
+            },
+        )
+        self._clear_dirty_updates()
+        return True
 
     @staticmethod
     def map_to_kernel_blocks(
@@ -231,10 +416,17 @@ class BlockTable:
         return self.block_table.np
 
     def _make_buffer(
-        self, *size: int | torch.SymInt, dtype: torch.dtype
+        self,
+        *size: int | torch.SymInt,
+        dtype: torch.dtype,
+        name: str | None = None,
     ) -> CpuGpuBuffer:
         return CpuGpuBuffer(
-            *size, dtype=dtype, device=self.device, pin_memory=self.pin_memory
+            *size,
+            dtype=dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            buffer_name=name,
         )
 
 
@@ -396,3 +588,28 @@ def _compute_slot_mapping_kernel(
         slot_ids = block_numbers * block_size + local_block_offsets
         slot_ids = tl.where(is_local, slot_ids, PAD_ID)
         tl.store(slot_mapping_ptr + offsets, slot_ids, mask=mask)
+
+
+@triton.jit
+def _apply_block_table_dirty_update_kernel(
+    block_table_ptr,
+    block_table_stride,
+    packed_updates_ptr,
+    values_offset,
+    BLOCK_SIZE: tl.constexpr,
+):
+    update_idx = tl.program_id(0)
+    meta_offset = update_idx * 3
+    row_idx = tl.load(packed_updates_ptr + meta_offset)
+    start_idx = tl.load(packed_updates_ptr + meta_offset + 1)
+    cu_end = tl.load(packed_updates_ptr + meta_offset + 2)
+    cu_start = tl.load(packed_updates_ptr + meta_offset - 1) if update_idx > 0 else 0
+    update_len = cu_end - cu_start
+
+    row_ptr = block_table_ptr + row_idx * block_table_stride + start_idx
+    values_ptr = packed_updates_ptr + values_offset + cu_start
+    for i in range(0, update_len, BLOCK_SIZE):
+        offsets = i + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < update_len
+        values = tl.load(values_ptr + offsets, mask=mask)
+        tl.store(row_ptr + offsets, values, mask=mask)
