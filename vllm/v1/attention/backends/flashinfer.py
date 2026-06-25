@@ -918,12 +918,18 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # reused CPU buffers to avoid a race condition between step N async copies to
         # GPU and step N+1 buffer updates.
         self.pin_memory = not vllm_config.use_v2_model_runner and PIN_MEMORY
-        self.paged_kv_indptr = self._make_buffer(max_num_reqs + 1)
+        self.paged_kv_indptr = self._make_buffer(
+            max_num_reqs + 1, name="flashinfer_paged_kv_indptr"
+        )
         self.paged_kv_indptr_cpu_buffer = torch.zeros_like(
             self.paged_kv_indptr.cpu, pin_memory=self.pin_memory
         )  # Extra buffer for mutable paged_kv_indptr.cpu in cuda graph mode
-        self.paged_kv_indices = self._make_buffer(max_num_pages)
-        self.paged_kv_last_page_len = self._make_buffer(max_num_reqs)
+        self.paged_kv_indices = self._make_buffer(
+            max_num_pages, name="flashinfer_paged_kv_indices"
+        )
+        self.paged_kv_last_page_len = self._make_buffer(
+            max_num_reqs, name="flashinfer_paged_kv_last_page_len"
+        )
 
     # Keep SM90 prefill/decode Q dtype selection in one place.
     def get_q_data_type(self, is_prefill: bool) -> torch.dtype:
@@ -964,7 +970,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         return self.kv_cache_spec.dtype
 
     def _make_buffer(
-        self, *size: int | torch.SymInt, dtype: torch.dtype = torch.int32
+        self,
+        *size: int | torch.SymInt,
+        dtype: torch.dtype = torch.int32,
+        name: str | None = None,
     ) -> CpuGpuBuffer:
         return CpuGpuBuffer(
             *size,
@@ -972,6 +981,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             device=self.device,
             pin_memory=self.pin_memory,
             with_numpy=True,
+            buffer_name=name,
         )
 
     @override  # type: ignore[misc]

@@ -58,7 +58,12 @@ class ExtractHiddenStatesProposer:
         )
 
         self.backup_next_token_ids = CpuGpuBuffer(
-            max_batch_size, dtype=torch.int32, device=device
+            max_batch_size,
+            dtype=torch.int32,
+            pin_memory=PIN_MEMORY,
+            device=device,
+            with_numpy=True,
+            buffer_name="spec_backup_next_token_ids",
         )
 
         self.hf_config = vllm_config.speculative_config.draft_model_config.hf_config
