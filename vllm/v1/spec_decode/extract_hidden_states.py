@@ -15,6 +15,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
 from vllm.v1.attention.backend import AttentionMetadataBuilder, CommonAttentionMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -58,7 +59,12 @@ class ExtractHiddenStatesProposer:
         )
 
         self.backup_next_token_ids = CpuGpuBuffer(
-            max_batch_size, dtype=torch.int32, device=device
+            max_batch_size,
+            dtype=torch.int32,
+            pin_memory=PIN_MEMORY,
+            device=device,
+            with_numpy=True,
+            buffer_name="spec_backup_next_token_ids",
         )
 
         self.hf_config = vllm_config.speculative_config.draft_model_config.hf_config
