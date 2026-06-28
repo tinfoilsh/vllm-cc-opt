@@ -1183,6 +1183,7 @@ class GPUModelRunner(
         self._cc_decode_metadata_fast_ready_req_ids: tuple[str, ...] | None = None
         self._cc_decode_metadata_has_logged_engaged = False
         self._cc_mtp_decode_metadata_has_logged_engaged = False
+        self._cc_mtp_decode_gpu_synced = False
         self._cc_mtp_cu_num_draft_tokens_gpu: torch.Tensor | None = None
         self._cc_mtp_cu_num_sampled_tokens_gpu: torch.Tensor | None = None
         self._cc_mtp_logits_indices_gpu: torch.Tensor | None = None
@@ -2657,37 +2658,34 @@ class GPUModelRunner(
         assert self.valid_sampled_token_count_gpu is not None
         k_sampled = k_draft + 1
 
-        # Sync num_computed_tokens from CPU when transitioning from non-MTP
-        # to MTP decode. The GPU value may be stale (e.g., 0 from prefill)
-        # because the previous step used the copy_from_cpu path which set
-        # GPU to 0 (CPU was 0 during prefill, before _update_states updated
-        # it to prompt_len). The kernel below reads GPU and adds valid_count,
+        # On the first MTP decode step after prefill (or regular decode),
+        # GPU num_computed_tokens may be stale (e.g., 0 from prefill's
+        # copy_from_cpu when CPU was 0 before _update_states updated it
+        # to prompt_len). The kernel below reads GPU and adds valid_count,
         # so GPU must be the actual previous computed count.
         #
-        # For the first MTP decode: CPU = prompt_len (actual), GPU = 0 (stale).
-        # We need GPU = CPU - valid_count so that kernel gives GPU + valid_count = CPU.
-        # For subsequent MTP decodes: CPU = prev_actual + k_sampled (optimistic),
-        # GPU = prev_actual (maintained by kernel). CPU - GPU = k_sampled, not stale.
-        cpu_num_computed = self.input_batch.num_computed_tokens_cpu_tensor[
-            :num_reqs
-        ].to(device=self.device)
-        gpu_num_computed = self.num_computed_tokens[:num_reqs]
-        # Detect staleness: GPU < CPU - k_sampled means GPU is from a
-        # pre-MTP step that didn't have the correct value.
-        stale_mask = gpu_num_computed < (cpu_num_computed - k_sampled)
-        if bool(stale_mask.any()):
-            # For stale entries, set GPU = CPU - valid_count so that
-            # the kernel's (GPU + valid_count) gives CPU (the correct value).
-            valid_counts = self.valid_sampled_token_count_gpu[:num_reqs].to(
-                dtype=gpu_num_computed.dtype
+        # We derive the correct value from seq_lens (GPU tensor), which
+        # holds num_computed_tokens + num_scheduled_tokens from the
+        # previous step. For prefill: seq_lens = 0 + prompt_len.
+        # For regular decode: seq_lens = num_computed + 1.
+        # Setting GPU = seq_lens - valid_count gives:
+        #   prefill:  prompt_len - valid_count
+        #   regular:  num_computed + 1 - valid_count = num_computed (when vc=1)
+        # The kernel then computes GPU + valid_count = seq_lens_prev,
+        # which is the correct new num_computed_tokens.
+        #
+        # This is entirely GPU-side (no CPU->GPU transfer), avoiding
+        # non-determinism from timing perturbation.
+        # On subsequent MTP steps, the kernel maintains GPU correctly
+        # (GPU = prev_computed + valid_count), so no sync needed.
+        # The flag is reset when MTP fastpath disengages (see _prepare_inputs).
+        if not self._cc_mtp_decode_gpu_synced:
+            gpu_num_computed = self.num_computed_tokens[:num_reqs]
+            gpu_num_computed.copy_(self.seq_lens[:num_reqs])
+            gpu_num_computed.sub_(
+                self.valid_sampled_token_count_gpu[:num_reqs]
             )
-            gpu_num_computed.copy_(
-                torch.where(
-                    stale_mask,
-                    cpu_num_computed - valid_counts,
-                    gpu_num_computed,
-                )
-            )
+            self._cc_mtp_decode_gpu_synced = True
 
         if not self._cc_mtp_decode_metadata_has_logged_engaged:
             logger.info(
@@ -3082,6 +3080,11 @@ class GPUModelRunner(
         cc_decode_metadata_fastpath = (
             cc_decode_metadata_fastpath or cc_mtp_decode_metadata_fastpath
         )
+
+        # Reset the GPU sync flag when MTP fastpath is not engaged,
+        # so the next MTP engagement will sync from seq_lens.
+        if not cc_mtp_decode_metadata_fastpath:
+            self._cc_mtp_decode_gpu_synced = False
 
         if not cc_decode_metadata_fastpath:
             # Get positions.
