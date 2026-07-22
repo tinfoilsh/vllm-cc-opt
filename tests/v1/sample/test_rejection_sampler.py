@@ -135,6 +135,7 @@ def create_sampling_metadata(
         presence_penalties=presence_penalties,
         repetition_penalties=repetition_penalties,
         output_token_ids=[] if output_token_ids is None else output_token_ids,
+        requires_cpu_output_token_history=True,
         spec_token_ids=[] if spec_token_ids is None else spec_token_ids,
         allowed_token_ids_mask=allowed_token_ids_mask,
         bad_words_token_ids={} if bad_words_token_ids is None else bad_words_token_ids,
