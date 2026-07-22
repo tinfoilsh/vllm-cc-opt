@@ -1160,6 +1160,7 @@ class GPUModelRunner(
             reasoning_config=self.vllm_config.reasoning_config,
             use_replayssm=self.cache_config.use_replayssm,
         )
+        self.pin_memory = PIN_MEMORY
 
         # Separate cuda stream for overlapping transfer of sampled token ids from
         # GPU to CPU when async scheduling is enabled.
