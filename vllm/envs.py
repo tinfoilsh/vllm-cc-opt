@@ -195,6 +195,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
+    VLLM_DISABLE_STRUCTURED_OUTPUT_REGEX: bool = False
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
     VLLM_ALLOW_INSECURE_SERIALIZATION: bool = False
     VLLM_DISABLE_REQUEST_ID_RANDOMIZATION: bool = False
@@ -1534,6 +1535,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Set to 0 to disable the timeout (not recommended in production).
     "VLLM_REGEX_COMPILATION_TIMEOUT_S": lambda: int(
         os.getenv("VLLM_REGEX_COMPILATION_TIMEOUT_S", "5")
+    ),
+    # Reject user-provided structured-output regex constraints. This is a
+    # defense-in-depth option for public services that do not require regex.
+    "VLLM_DISABLE_STRUCTURED_OUTPUT_REGEX": lambda: bool(
+        int(os.getenv("VLLM_DISABLE_STRUCTURED_OUTPUT_REGEX", "0"))
     ),
     # Control the threshold for msgspec to use 'zero copy' for
     # serialization/deserialization of tensors. Tensors below

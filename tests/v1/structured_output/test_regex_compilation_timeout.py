@@ -10,10 +10,12 @@ Addresses advisory GHSA-rwxx-mrjm-wc2m.
 """
 
 import time
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
+from vllm.config import StructuredOutputsConfig
+from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.structured_output.utils import compile_regex_with_timeout
 
 
@@ -59,3 +61,15 @@ class TestCompileRegexWithTimeout:
             pytest.raises(ValueError, match=r"\(a\+\)\+b"),
         ):
             compile_regex_with_timeout(slow_compile, pattern)
+
+
+def test_server_can_disable_structured_output_regex():
+    params = SamplingParams(
+        structured_outputs=StructuredOutputsParams(regex=r"[a-z]+")
+    )
+
+    with (
+        patch("vllm.envs.VLLM_DISABLE_STRUCTURED_OUTPUT_REGEX", True),
+        pytest.raises(ValueError, match="disabled by the server"),
+    ):
+        params._validate_structured_outputs(StructuredOutputsConfig(), Mock())
