@@ -187,6 +187,29 @@ def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
 
 
 @cache
+@with_nvml_context
+def confidential_compute_enabled() -> bool:
+    """Query NVML for the system confidential-compute state."""
+    from ctypes import byref
+
+    try:
+        settings = pynvml.c_nvmlSystemConfComputeSettings_v1_t()
+        ret = pynvml.nvmlSystemGetConfComputeSettings(byref(settings))
+        pynvml._nvmlCheckReturn(ret)
+        return (
+            settings.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+            or settings.multiGpuMode != pynvml.NVML_CC_SYSTEM_MULTIGPU_NONE
+        )
+    except (AttributeError, pynvml.NVMLError):
+        try:
+            state = pynvml.nvmlSystemGetConfComputeState()
+            return state.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+        except (AttributeError, pynvml.NVMLError) as exc:
+            logger.warning("Could not query confidential compute state: %s", exc)
+            return False
+
+
+@cache
 def _get_wsl_kernel_version() -> tuple[int, ...] | None:
     """Return the WSL2 kernel version as a tuple, or None on parse failure.
 
@@ -251,6 +274,10 @@ class CudaPlatformBase(Platform):
     @classmethod
     def manual_seed_all(cls, seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
+
+    @classmethod
+    def is_confidential_compute_enabled(cls) -> bool:
+        return confidential_compute_enabled()
 
     @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
