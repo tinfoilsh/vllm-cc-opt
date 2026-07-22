@@ -220,6 +220,11 @@ if TYPE_CHECKING:
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
     VLLM_DISABLE_STRUCTURED_OUTPUT_REGEX: bool = False
+    VLLM_CC_PAGEABLE_H2D: bool = False
+    VLLM_CC_OUTPUT_WORKER: bool = False
+    VLLM_CC_SPEC_COUNT_FAST_PUBLICATION: bool = False
+    VLLM_CC_DECODE_METADATA_FASTPATH: bool = False
+    VLLM_CC_BLOCK_TABLE_DIRTY_UPDATE: bool = False
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
     VLLM_ALLOW_INSECURE_SERIALIZATION: bool = False
     VLLM_DISABLE_REQUEST_ID_RANDOMIZATION: bool = False
@@ -1635,6 +1640,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # defense-in-depth option for public services that do not require regex.
     "VLLM_DISABLE_STRUCTURED_OUTPUT_REGEX": lambda: bool(
         int(os.getenv("VLLM_DISABLE_STRUCTURED_OUTPUT_REGEX", "0"))
+    ),
+    # Register the deployment's CC fast-path gates so vLLM's environment
+    # validator recognizes them. The implementations read these directly to
+    # preserve compatibility with the v0.23 deployment controls.
+    "VLLM_CC_PAGEABLE_H2D": lambda: bool(
+        int(os.getenv("VLLM_CC_PAGEABLE_H2D", "0"))
+    ),
+    "VLLM_CC_OUTPUT_WORKER": lambda: bool(
+        int(os.getenv("VLLM_CC_OUTPUT_WORKER", "0"))
+    ),
+    "VLLM_CC_SPEC_COUNT_FAST_PUBLICATION": lambda: bool(
+        int(os.getenv("VLLM_CC_SPEC_COUNT_FAST_PUBLICATION", "0"))
+    ),
+    "VLLM_CC_DECODE_METADATA_FASTPATH": lambda: bool(
+        int(os.getenv("VLLM_CC_DECODE_METADATA_FASTPATH", "0"))
+    ),
+    "VLLM_CC_BLOCK_TABLE_DIRTY_UPDATE": lambda: bool(
+        int(os.getenv("VLLM_CC_BLOCK_TABLE_DIRTY_UPDATE", "0"))
     ),
     # Control the threshold for msgspec to use 'zero copy' for
     # serialization/deserialization of tensors. Tensors below
