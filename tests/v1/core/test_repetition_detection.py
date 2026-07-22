@@ -2,11 +2,58 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import pytest
 
-from vllm.sampling_params import RepetitionDetectionParams, SamplingParams
+from vllm.sampling_params import (
+    RepetitionDetectionParams,
+    SamplingParams,
+    StructuredOutputsParams,
+)
 from vllm.v1.core.sched.utils import check_sequence_repetition, check_stop
 from vllm.v1.request import Request, RequestStatus
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.parametrize(
+    "structured_outputs",
+    [
+        StructuredOutputsParams(json={"type": "object"}),
+        StructuredOutputsParams(json_object=True),
+        StructuredOutputsParams(grammar='root ::= "ok"'),
+    ],
+)
+def test_grammar_constraints_enable_repetition_detection(structured_outputs):
+    params = SamplingParams(structured_outputs=structured_outputs)
+
+    assert params.repetition_detection == RepetitionDetectionParams(
+        max_pattern_size=20,
+        min_pattern_size=3,
+        min_count=4,
+    )
+
+
+@pytest.mark.parametrize(
+    "structured_outputs",
+    [
+        StructuredOutputsParams(regex="[a-z]+"),
+        StructuredOutputsParams(choice=["yes", "no"]),
+    ],
+)
+def test_non_grammar_constraints_do_not_enable_repetition_detection(
+    structured_outputs,
+):
+    params = SamplingParams(structured_outputs=structured_outputs)
+
+    assert params.repetition_detection is None
+
+
+def test_explicit_repetition_detection_opt_out_is_preserved():
+    disabled = RepetitionDetectionParams()
+    params = SamplingParams(
+        structured_outputs=StructuredOutputsParams(json_object=True),
+        repetition_detection=disabled,
+    )
+
+    assert params.repetition_detection is disabled
 
 # ============================================================================
 # UNIT TESTS - check_sequence_repetition function
