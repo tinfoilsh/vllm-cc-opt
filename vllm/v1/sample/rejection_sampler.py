@@ -324,7 +324,7 @@ class RejectionSampler(nn.Module):
         ):
             output_token_ids_np = output_token_ids.cpu().numpy()
             # Create mask for valid tokens.
-            valid_mask = (output_token_ids_np != PLACEHOLDER_TOKEN_ID) & (
+            valid_mask = (output_token_ids_np >= 0) & (
                 output_token_ids_np < vocab_size
             )
             output_logprobs = None
@@ -1027,12 +1027,17 @@ def sample_recovered_tokens_kernel(
             other=0.0,
         )
 
-        # Local tile reduction
+        # Local tile reduction.
+        # Mask out-of-vocabulary entries to -inf so they can never win
+        # the argmax — prevents producing recovered_id >= vocab_size
+        # when all valid entries in the last tile have zero probability.
         score = prob * inv_q
+        score = tl.where(vocab_mask, score, float("-inf"))
         local_max, local_id = tl.max(score, axis=0, return_indices=True)
 
         if local_max > max_val:
             max_val = local_max
             recovered_id = v + local_id
 
+    recovered_id = tl.minimum(recovered_id, vocab_size - 1)
     tl.store(output_token_ids_ptr + token_idx, recovered_id)
