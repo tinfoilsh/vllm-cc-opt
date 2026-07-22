@@ -48,6 +48,19 @@ def create_spec_decode_metadata(
     return metadata
 
 
+def test_parse_output_rejects_all_negative_token_ids():
+    output_token_ids = torch.tensor(
+        [[5, PLACEHOLDER_TOKEN_ID, -2, 99]], dtype=torch.int32
+    )
+
+    outputs, logprobs = RejectionSampler.parse_output(
+        output_token_ids, vocab_size=100
+    )
+
+    assert outputs == [[5, 99]]
+    assert logprobs is None
+
+
 def create_logits_tensor(
     output_token_ids: list[list[int]],
     vocab_size: int = 100,

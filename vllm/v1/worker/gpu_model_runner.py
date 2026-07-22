@@ -535,7 +535,7 @@ def _calc_valid_sampled_token_count(
     invalid_req_indices: Sequence[int],
 ) -> list[int]:
     sampled_token_ids_np = sampled_token_ids_cpu.numpy()
-    valid_mask = (sampled_token_ids_np != PLACEHOLDER_TOKEN_ID) & (
+    valid_mask = (sampled_token_ids_np >= 0) & (
         sampled_token_ids_np < vocab_size
     )
     if invalid_req_indices:

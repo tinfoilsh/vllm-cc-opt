@@ -299,6 +299,16 @@ class BlockTable:
         no ordering guarantee. Merge overlapping or adjacent ranges so each GPU
         destination is written once with the authoritative final CPU value.
         """
+        metadata_lengths = {
+            len(self._dirty_rows),
+            len(self._dirty_starts),
+            len(self._dirty_cu_lens),
+        }
+        if len(metadata_lengths) != 1:
+            raise ValueError("Inconsistent block-table dirty-update metadata")
+
+        table_rows, table_cols = self.block_table.np.shape
+        total_values = len(self._dirty_values)
         ranges_by_row: dict[int, list[tuple[int, int]]] = {}
         previous_cu_len = 0
         for row, start, cu_len in zip(
@@ -306,11 +316,24 @@ class BlockTable:
             self._dirty_starts,
             self._dirty_cu_lens,
         ):
+            if cu_len < previous_cu_len or cu_len > total_values:
+                raise ValueError("Invalid block-table dirty-update cumulative length")
             update_len = cu_len - previous_cu_len
             previous_cu_len = cu_len
             if update_len <= 0:
                 continue
-            ranges_by_row.setdefault(row, []).append((start, start + update_len))
+            end = start + update_len
+            if not 0 <= row < table_rows:
+                raise ValueError(f"Block-table dirty-update row out of bounds: {row}")
+            if not 0 <= start < end <= table_cols:
+                raise ValueError(
+                    "Block-table dirty-update range out of bounds: "
+                    f"row={row}, start={start}, end={end}, columns={table_cols}"
+                )
+            ranges_by_row.setdefault(row, []).append((start, end))
+
+        if previous_cu_len != total_values:
+            raise ValueError("Unreferenced block-table dirty-update values")
 
         rows: list[int] = []
         starts: list[int] = []
