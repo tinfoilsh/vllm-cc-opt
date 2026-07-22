@@ -266,7 +266,7 @@ class RejectionSampler(nn.Module):
         """
         output_token_ids_np = output_token_ids.cpu().numpy()
         # Create mask for valid tokens.
-        valid_mask = (output_token_ids_np != PLACEHOLDER_TOKEN_ID) & (
+        valid_mask = (output_token_ids_np >= 0) & (
             output_token_ids_np < vocab_size
         )
         output_logprobs = None

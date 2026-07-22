@@ -1379,6 +1379,43 @@ def test_block_table_dirty_updates_coalesce_overlaps():
     assert cu_lens == [3, 7]
 
 
+@pytest.mark.parametrize(
+    ("row", "start", "cu_len"),
+    [
+        (-1, 0, 1),
+        (2, 0, 1),
+        (0, -1, 1),
+        (0, 8, 1),
+    ],
+)
+def test_block_table_dirty_updates_reject_out_of_bounds(row, start, cu_len):
+    from vllm.v1.worker.block_table import BlockTable
+
+    block_table = BlockTable.__new__(BlockTable)
+    block_table.block_table = SimpleNamespace(
+        np=np.zeros((2, 8), dtype=np.int32)
+    )
+    block_table._dirty_rows = [row]
+    block_table._dirty_starts = [start]
+    block_table._dirty_values = [42]
+    block_table._dirty_cu_lens = [cu_len]
+
+    with pytest.raises(ValueError, match="out of bounds"):
+        block_table._coalesce_dirty_updates()
+
+
+def test_valid_sampled_token_count_rejects_all_negative_token_ids():
+    sampled_token_ids = torch.tensor(
+        [[5, -1, -2, 99], [0, 10, 11, 12]], dtype=torch.int32
+    )
+
+    counts = gpu_model_runner_module._calc_valid_sampled_token_count(
+        sampled_token_ids, vocab_size=11, invalid_req_indices=[]
+    )
+
+    assert counts == [1, 2]
+
+
 def test_input_batch_with_kernel_block_sizes():
     """Test InputBatch initialization with kernel_block_sizes parameter."""
     max_num_reqs = 10
