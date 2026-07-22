@@ -157,6 +157,14 @@ class StructuredOutputsParams:
             )
         )
 
+    def uses_grammar_constraint(self) -> bool:
+        """Whether this constraint applies a grammar token mask."""
+        return (
+            self.json is not None
+            or bool(self.json_object)
+            or self.grammar is not None
+        )
+
 
 @dataclass
 class RepetitionDetectionParams:
@@ -527,6 +535,23 @@ class SamplingParams(
 
         # eos_token_id is added to this by the engine
         self._all_stop_token_ids.update(self.stop_token_ids)
+
+        # Grammar masks can amplify Gemma's rare degenerate repetition loops.
+        # Preserve an explicit all-zero value as the caller's opt-out.
+        if (
+            self.structured_outputs is not None
+            and self.repetition_detection is None
+            and self.structured_outputs.uses_grammar_constraint()
+        ):
+            self.repetition_detection = RepetitionDetectionParams(
+                max_pattern_size=20,
+                min_pattern_size=3,
+                min_count=4,
+            )
+            logger.info_once(
+                "Auto-enabled repetition detection for grammar-constrained "
+                "structured output requests."
+            )
 
         if self.skip_reading_prefix_cache is None:
             # If prefix caching is enabled,
