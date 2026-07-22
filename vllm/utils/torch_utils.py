@@ -18,7 +18,7 @@ from torch.library import Library, infer_schema
 
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.utils.platform_utils import prefer_pinned
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
@@ -71,7 +71,7 @@ MODELOPT_TO_VLLM_KV_CACHE_DTYPE_MAP = {
 T = TypeVar("T")
 
 
-PIN_MEMORY = is_pin_memory_available()
+PIN_MEMORY = prefer_pinned()
 
 
 def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import multiprocessing
+import os
 from collections.abc import Sequence
 from concurrent.futures.process import ProcessPoolExecutor
 from functools import cache
@@ -45,6 +46,25 @@ def is_pin_memory_available() -> bool:
     from vllm.platforms import current_platform
 
     return current_platform.is_pin_memory_available()
+
+
+@cache
+def prefer_pinned() -> bool:
+    """Return whether discretionary host staging should use pinned memory.
+
+    GPU confidential computing sends host transfers through an encrypted bounce
+    path, so pinning small staging buffers adds overhead without enabling the
+    usual direct asynchronous DMA. The explicit gate also makes A/B runs
+    deterministic when NVML state discovery is unavailable.
+    """
+    if os.environ.get("VLLM_CC_PAGEABLE_H2D", "0") == "1":
+        return False
+    if not is_pin_memory_available():
+        return False
+
+    from vllm.platforms import current_platform
+
+    return not current_platform.is_confidential_compute_enabled()
 
 
 @cache
