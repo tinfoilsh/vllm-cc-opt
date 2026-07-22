@@ -702,12 +702,11 @@ class GPUModelRunner(
                 custom_logitsprocs,
             ),
             # We currently don't know whether a particular custom logits processor
-            # uses output token ids so we set this conservatively. Reasoning
-            # token budgets are handled dynamically by
-            # thinking_budget_tracks_reqs in InputBatch.make_sampling_metadata,
-            # so merely configuring a reasoning parser does not force every
-            # request onto the sampled-token CPU history path.
-            logitsprocs_need_output_token_ids=bool(custom_logitsprocs),
+            # uses output token ids so we set this conservatively.
+            # ThinkingTokenBudgetLogitsProcessor also needs output token ids to
+            # correctly track think start/end token sequences in async scheduling.
+            logitsprocs_need_output_token_ids=bool(custom_logitsprocs)
+            or self.vllm_config.reasoning_config is not None,
             is_pooling_model=self.is_pooling_model,
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
             reasoning_config=self.vllm_config.reasoning_config,
