@@ -1351,6 +1351,34 @@ def test_hybrid_block_table_initialization():
     )
 
 
+def test_block_table_dirty_updates_coalesce_overlaps():
+    from vllm.v1.worker.block_table import BlockTable
+
+    block_table = BlockTable.__new__(BlockTable)
+    block_table.block_table = SimpleNamespace(
+        np=np.array(
+            [
+                [10, 11, 12, 13, 14, 15, 16, 17],
+                [20, 21, 22, 23, 24, 25, 26, 27],
+            ],
+            dtype=np.int32,
+        )
+    )
+    # Row 1 simulates overlapping clear/reuse writes. Row 0 has adjacent
+    # appends. Both must become disjoint writes sourced from final CPU state.
+    block_table._dirty_rows = [1, 1, 1, 0, 0]
+    block_table._dirty_starts = [0, 2, 1, 4, 6]
+    block_table._dirty_values = [0] * 10
+    block_table._dirty_cu_lens = [4, 6, 7, 9, 10]
+
+    rows, starts, values, cu_lens = block_table._coalesce_dirty_updates()
+
+    assert rows == [0, 1]
+    assert starts == [4, 0]
+    assert values == [14, 15, 16, 20, 21, 22, 23]
+    assert cu_lens == [3, 7]
+
+
 def test_input_batch_with_kernel_block_sizes():
     """Test InputBatch initialization with kernel_block_sizes parameter."""
     max_num_reqs = 10
