@@ -979,6 +979,15 @@ class SamplingParams(
                 "Structured outputs requires a tokenizer so it can't be used with 'skip_tokenizer_init'"  # noqa: E501
             )
 
+        if (
+            envs.VLLM_DISABLE_STRUCTURED_OUTPUT_REGEX
+            and self.structured_outputs.regex is not None
+        ):
+            raise VLLMValidationError(
+                "structured_outputs.regex is disabled by the server",
+                parameter="structured_outputs.regex",
+            )
+
         backend = structured_outputs_config.backend
         if _backend := self.structured_outputs._backend:
             # Request-level backend selection is not supported.
