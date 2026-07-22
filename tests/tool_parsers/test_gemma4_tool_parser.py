@@ -462,6 +462,42 @@ class TestStreamingExtraction:
         parsed_args = json.loads(args_text)
         assert parsed_args == {"location": "Tokyo", "unit": "celsius"}
 
+    def test_streaming_parallel_calls_with_joined_end_start_chunk(
+        self, parser, mock_request
+    ):
+        """The next start marker must not hide the previous final arguments."""
+        chunks = [
+            "<|tool_call>",
+            'call:get_weather{city:<|"|>Paris<|"|>}',
+            "<tool_call|><|tool_call>",
+            'call:get_weather{city:<|"|>Tokyo<|"|>}',
+            "<tool_call|>",
+        ]
+
+        results = self._simulate_streaming(parser, mock_request, chunks)
+        names: dict[int, str] = {}
+        arguments: dict[int, str] = {}
+        for delta, _ in results:
+            if delta is None:
+                continue
+            for tool_call in delta.tool_calls or []:
+                function = tool_call.function
+                if isinstance(function, dict):
+                    name = function.get("name")
+                    argument_delta = function.get("arguments") or ""
+                else:
+                    name = getattr(function, "name", None)
+                    argument_delta = getattr(function, "arguments", None) or ""
+                if name:
+                    names[tool_call.index] = name
+                arguments[tool_call.index] = (
+                    arguments.get(tool_call.index, "") + argument_delta
+                )
+
+        assert names == {0: "get_weather", 1: "get_weather"}
+        assert json.loads(arguments[0]) == {"city": "Paris"}
+        assert json.loads(arguments[1]) == {"city": "Tokyo"}
+
     def test_streaming_no_extra_brace(self, parser, mock_request):
         """Verify the closing } is NOT leaked into arguments (Bug #2)."""
         chunks = [

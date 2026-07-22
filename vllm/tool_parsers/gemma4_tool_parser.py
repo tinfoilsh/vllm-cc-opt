@@ -539,6 +539,24 @@ class Gemma4ToolParser(ToolParser):
         prev_start_count = previous_text.count(self.tool_call_start_token)
         prev_end_count = previous_text.count(self.tool_call_end_token)
 
+        # A tokenizer chunk can contain both the previous call's end marker
+        # and the next call's start marker. Flush the completed call before
+        # advancing the active index, then emit both deltas together. Doing
+        # this in the opposite order loses the previous call's arguments.
+        if (
+            start_count > prev_start_count
+            and end_count > prev_end_count
+            and self.current_tool_id >= 0
+        ):
+            completed_delta = self._handle_tool_call_end(current_text)
+            self._begin_tool_call()
+            started_delta = (
+                self._handle_tool_call_middle(current_text)
+                if start_count > end_count
+                else None
+            )
+            return self._combine_tool_call_deltas(completed_delta, started_delta)
+
         # Case 1: Not inside any tool call — emit as content
         if (
             start_count == end_count
@@ -551,11 +569,7 @@ class Gemma4ToolParser(ToolParser):
 
         # Case 2: Starting a new tool call
         if start_count > prev_start_count and start_count > end_count:
-            self.current_tool_id += 1
-            self.current_tool_name_sent = False
-            self.streamed_args_for_tool.append("")
-            self.prev_tool_call_arr.append({})
-            logger.debug("Starting new tool call %d", self.current_tool_id)
+            self._begin_tool_call()
             # Don't return yet — fall through to try parsing if there's
             # content after <|tool_call> in this same delta
             # (but usually it's just the token itself, so return None)
@@ -577,6 +591,30 @@ class Gemma4ToolParser(ToolParser):
             if text:
                 return DeltaMessage(content=text)
         return None
+
+    def _begin_tool_call(self) -> None:
+        self.current_tool_id += 1
+        self.current_tool_name_sent = False
+        self.streamed_args_for_tool.append("")
+        self.prev_tool_call_arr.append({})
+        logger.debug("Starting new tool call %d", self.current_tool_id)
+
+    @staticmethod
+    def _combine_tool_call_deltas(
+        first: DeltaMessage | None, second: DeltaMessage | None
+    ) -> DeltaMessage | None:
+        messages = [message for message in (first, second) if message is not None]
+        if not messages:
+            return None
+        if len(messages) == 1:
+            return messages[0]
+        return DeltaMessage(
+            tool_calls=[
+                tool_call
+                for message in messages
+                for tool_call in (message.tool_calls or [])
+            ]
+        )
 
     def _extract_partial_call(self, current_text: str) -> tuple[str | None, str]:
         """Extract function name and raw argument string from partial text.
