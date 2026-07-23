@@ -10,6 +10,7 @@ import contextlib
 import os
 import platform
 from collections.abc import Callable
+from ctypes import byref
 from datetime import timedelta
 from functools import cache, lru_cache, wraps
 from typing import TYPE_CHECKING, NamedTuple, TypeVar
@@ -191,6 +192,40 @@ def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
 
 
 @cache
+def confidential_compute_enabled() -> bool:
+    """Query NVML for the system confidential-compute state.
+
+    The system CC mode cannot change during a process lifetime, so cache the
+    result. Treat protected multi-GPU transport as confidential compute even
+    if the per-GPU CC feature flag is not set.
+    """
+    try:
+        pynvml.nvmlInit()
+    except (AttributeError, pynvml.NVMLError) as exc:
+        logger.warning_once("Could not initialize NVML to query CC state: %s", exc)
+        return False
+
+    try:
+        try:
+            settings = pynvml.c_nvmlSystemConfComputeSettings_v1_t()
+            ret = pynvml.nvmlSystemGetConfComputeSettings(byref(settings))
+            pynvml._nvmlCheckReturn(ret)
+            return (
+                settings.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+                or settings.multiGpuMode != pynvml.NVML_CC_SYSTEM_MULTIGPU_NONE
+            )
+        except (AttributeError, pynvml.NVMLError):
+            state = pynvml.nvmlSystemGetConfComputeState()
+            return state.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+    except (AttributeError, pynvml.NVMLError) as exc:
+        logger.warning_once("Could not query confidential-compute state: %s", exc)
+        return False
+    finally:
+        with contextlib.suppress(AttributeError, pynvml.NVMLError):
+            pynvml.nvmlShutdown()
+
+
+@cache
 def _get_wsl_kernel_version() -> tuple[int, ...] | None:
     """Return the WSL2 kernel version as a tuple, or None on parse failure.
 
@@ -303,6 +338,10 @@ class CudaPlatformBase(Platform):
 
             return envs.VLLM_WSL2_ENABLE_PIN_MEMORY
         return True
+
+    @classmethod
+    def is_confidential_compute_enabled(cls) -> bool:
+        return confidential_compute_enabled()
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:

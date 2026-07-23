@@ -5,6 +5,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
+from vllm.utils.platform_utils import prefer_pinned
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
@@ -50,7 +51,10 @@ class StructuredOutputsWorker:
         # Asynchronously copy the mapping to GPU.
         with torch.cuda.stream(self.copy_stream):
             logits_indices = torch.tensor(
-                mapping, dtype=torch.int32, device="cpu", pin_memory=True
+                mapping,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=prefer_pinned(),
             )
             logits_indices = self.logits_indices[: len(mapping)].copy_(
                 logits_indices, non_blocking=True

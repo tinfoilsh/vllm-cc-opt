@@ -7,7 +7,11 @@ import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
-from vllm.utils.platform_utils import is_uva_available
+from vllm.utils.platform_utils import (
+    is_uva_available,
+    maybe_pin_memory,
+    prefer_pinned,
+)
 from vllm.utils.torch_utils import (
     async_tensor_h2d,
     get_accelerator_view_from_cpu_tensor,
@@ -36,9 +40,8 @@ def async_copy_to_gpu(
         assert device is not None
         out = torch.empty_like(x, device=device)
 
-    # pin_memory() is no-op if the memory is already pinned.
-    pinned = x.pin_memory()
-    return out.copy_(pinned, non_blocking=True)
+    staged = maybe_pin_memory(x)
+    return out.copy_(staged, non_blocking=True)
 
 
 class UvaBuffer:
@@ -182,7 +185,10 @@ class StagedWriteTensor:
 
         # Special handling for write_contents
         write_contents = async_tensor_h2d(
-            self._staged_write_contents, device=self.device, dtype=self.dtype
+            self._staged_write_contents,
+            device=self.device,
+            dtype=self.dtype,
+            pin_memory=prefer_pinned(),
         )
 
         # Write diffs to the GPU buffer
@@ -254,7 +260,12 @@ class FusedStagedWriter:
         indices_uva = self.indices.copy_to_uva(indices)
         starts_uva = self.starts.copy_to_uva(starts)
         cu_lens_uva = self.cu_lens.copy_to_uva(cu_lens)
-        contents_gpu = async_tensor_h2d(contents, device=self.device, dtype=torch.int32)
+        contents_gpu = async_tensor_h2d(
+            contents,
+            device=self.device,
+            dtype=torch.int32,
+            pin_memory=prefer_pinned(),
+        )
 
         _apply_write_kernel[(len(group_ids),)](
             output_ptrs,

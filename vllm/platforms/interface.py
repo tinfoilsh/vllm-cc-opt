@@ -1000,6 +1000,11 @@ class Platform:
         return True
 
     @classmethod
+    def is_confidential_compute_enabled(cls) -> bool:
+        """Whether the accelerator is operating in confidential-compute mode."""
+        return False
+
+    @classmethod
     def get_current_memory_usage(
         cls, device: torch.types.Device | None = None
     ) -> float:

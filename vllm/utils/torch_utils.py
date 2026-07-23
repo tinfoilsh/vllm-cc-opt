@@ -574,14 +574,15 @@ def async_tensor_h2d(
     data: list | np.ndarray | torch.Tensor,
     device: str | torch.device,
     dtype: torch.dtype | None = None,
+    pin_memory: bool = PIN_MEMORY,
 ) -> torch.Tensor:
     """Copy list/numpy array/tensor async from host to device."""
     if isinstance(data, np.ndarray):
         data = torch.from_numpy(data)
     if isinstance(data, torch.Tensor):
-        t = data.pin_memory() if PIN_MEMORY else data
+        t = data.pin_memory() if pin_memory else data
     else:
-        t = torch.tensor(data, dtype=dtype, pin_memory=PIN_MEMORY, device="cpu")
+        t = torch.tensor(data, dtype=dtype, pin_memory=pin_memory, device="cpu")
     assert t.is_cpu
     return t.to(device=device, dtype=dtype, non_blocking=True)
 

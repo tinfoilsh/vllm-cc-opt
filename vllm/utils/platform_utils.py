@@ -48,6 +48,28 @@ def is_pin_memory_available() -> bool:
 
 
 @cache
+def prefer_pinned() -> bool:
+    """Whether discretionary host staging should use pinned memory.
+
+    This is a performance policy, unlike :func:`is_pin_memory_available`,
+    which reports a capability and continues to gate features such as UVA.
+    Small pageable H2D transfers retain useful asynchronous behavior under
+    NVIDIA confidential compute, whereas pinned transfers generally do not.
+    """
+    if not is_pin_memory_available():
+        return False
+
+    from vllm.platforms import current_platform
+
+    return not current_platform.is_confidential_compute_enabled()
+
+
+def maybe_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
+    """Pin ``tensor`` when the active platform policy prefers it."""
+    return tensor.pin_memory() if prefer_pinned() else tensor
+
+
+@cache
 def is_uva_available() -> bool:
     """Check if Unified Virtual Addressing (UVA) is available."""
     # UVA requires pinned memory.
