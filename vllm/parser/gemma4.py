@@ -41,6 +41,10 @@ TOOL_CALL_START = "<|tool_call>"
 TOOL_CALL_END = "<tool_call|>"
 STRING_DELIM = '<|"|>'
 _DELIM_LEN = len(STRING_DELIM)
+# Cap nesting depth to prevent unbounded recursion (RecursionError -> HTTP
+# 500) and quadratic re-slicing on adversarially deep tool-call arguments.
+# Real tool calls nest only a few levels; 64 is far above any legit payload.
+_MAX_PARSE_DEPTH = 64
 
 logger = init_logger(__name__)
 
@@ -65,7 +69,9 @@ def _strip_partial_delim(value: str) -> str:
     return value
 
 
-def _parse_gemma4_args(args_str: str, *, partial: bool = False) -> dict:
+def _parse_gemma4_args(
+    args_str: str, *, partial: bool = False, _depth: int = 0
+) -> dict:
     """Parse Gemma4's custom key:value format into a Python dict.
 
     Format examples::
@@ -84,6 +90,13 @@ def _parse_gemma4_args(args_str: str, *, partial: bool = False) -> dict:
 
     Returns a dict ready for ``json.dumps()``.
     """
+    if _depth > _MAX_PARSE_DEPTH:
+        logger.warning(
+            "Gemma4 args parser exceeded max nesting depth %d; "
+            "truncating deeper structure.",
+            _MAX_PARSE_DEPTH,
+        )
+        return {}
     if not args_str or not args_str.strip():
         return {}
 
@@ -152,9 +165,9 @@ def _parse_gemma4_args(args_str: str, *, partial: bool = False) -> dict:
             if depth > 0:
                 # Incomplete nested object — use i (not i-1) to avoid
                 # dropping the last char, and recurse as partial.
-                result[key] = _parse_gemma4_args(args_str[obj_start:i], partial=True)
+                result[key] = _parse_gemma4_args(args_str[obj_start:i], partial=True, _depth=_depth + 1)
             else:
-                result[key] = _parse_gemma4_args(args_str[obj_start : i - 1])
+                result[key] = _parse_gemma4_args(args_str[obj_start : i - 1], _depth=_depth + 1)
 
         elif args_str[i] == "[":
             depth = 1
@@ -172,9 +185,9 @@ def _parse_gemma4_args(args_str: str, *, partial: bool = False) -> dict:
                     depth -= 1
                 i += 1
             if depth > 0:
-                result[key] = _parse_gemma4_array(args_str[arr_start:i], partial=True)
+                result[key] = _parse_gemma4_array(args_str[arr_start:i], partial=True, _depth=_depth + 1)
             else:
-                result[key] = _parse_gemma4_array(args_str[arr_start : i - 1])
+                result[key] = _parse_gemma4_array(args_str[arr_start : i - 1], _depth=_depth + 1)
 
         else:
             val_start = i
@@ -201,7 +214,16 @@ def _parse_gemma4_args(args_str: str, *, partial: bool = False) -> dict:
     return result
 
 
-def _parse_gemma4_array(arr_str: str, *, partial: bool = False) -> list:
+def _parse_gemma4_array(
+    arr_str: str, *, partial: bool = False, _depth: int = 0
+) -> list:
+    if _depth > _MAX_PARSE_DEPTH:
+        logger.warning(
+            "Gemma4 array parser exceeded max nesting depth %d; "
+            "truncating deeper structure.",
+            _MAX_PARSE_DEPTH,
+        )
+        return []
     items: list = []
     i = 0
     n = len(arr_str)
@@ -237,9 +259,9 @@ def _parse_gemma4_array(arr_str: str, *, partial: bool = False) -> list:
                     depth -= 1
                 i += 1
             if depth > 0:
-                items.append(_parse_gemma4_args(arr_str[obj_start:i], partial=True))
+                items.append(_parse_gemma4_args(arr_str[obj_start:i], partial=True, _depth=_depth + 1))
             else:
-                items.append(_parse_gemma4_args(arr_str[obj_start : i - 1]))
+                items.append(_parse_gemma4_args(arr_str[obj_start : i - 1], _depth=_depth + 1))
 
         elif arr_str[i] == "[":
             depth = 1
@@ -257,9 +279,9 @@ def _parse_gemma4_array(arr_str: str, *, partial: bool = False) -> list:
                     depth -= 1
                 i += 1
             if depth > 0:
-                items.append(_parse_gemma4_array(arr_str[sub_start:i], partial=True))
+                items.append(_parse_gemma4_array(arr_str[sub_start:i], partial=True, _depth=_depth + 1))
             else:
-                items.append(_parse_gemma4_array(arr_str[sub_start : i - 1]))
+                items.append(_parse_gemma4_array(arr_str[sub_start : i - 1], _depth=_depth + 1))
 
         else:
             val_start = i
