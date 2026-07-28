@@ -45,6 +45,14 @@ _DELIM_LEN = len(STRING_DELIM)
 # 500) and quadratic re-slicing on adversarially deep tool-call arguments.
 # Real tool calls nest only a few levels; 64 is far above any legit payload.
 _MAX_PARSE_DEPTH = 64
+# Streaming re-parses the whole accumulated argument buffer on every push, so
+# arguments dense in structural characters cost O(n^2) over one tool call.
+# Below the threshold every push converts, keeping normal tool calls
+# byte-identical; above it, convert only once the buffer has grown by a
+# constant factor, which makes the total amortized linear while still
+# streaming argument deltas.
+_ARGS_STREAM_THRESHOLD = 2048
+_ARGS_STREAM_GROWTH = 1.5
 
 logger = init_logger(__name__)
 
@@ -436,12 +444,29 @@ class Gemma4Parser(ParserEngine):
         self._reasoning_text: str = ""
         self._prefix_stripped: bool = False
         self._is_first_feed: bool = True
+        self._next_args_convert_len: int = 0
+        self._arg_converter = self._convert_args
 
     def _reset(self, initial_state=None) -> None:
         super()._reset(initial_state=initial_state)
         self._reasoning_text = ""
         self._prefix_stripped = False
         self._is_first_feed = True
+        self._next_args_convert_len = 0
+
+    def _convert_args(self, raw_args: str, partial: bool) -> str:
+        """Convert arguments, backing off re-parse frequency on large buffers.
+
+        Returning an empty string suppresses one streaming delta; the final
+        non-partial flush always converts, so the emitted arguments are
+        unchanged.
+        """
+        length = len(raw_args)
+        if partial and length > _ARGS_STREAM_THRESHOLD:
+            if length < self._next_args_convert_len:
+                return ""
+            self._next_args_convert_len = int(length * _ARGS_STREAM_GROWTH)
+        return _gemma4_arg_converter(raw_args, partial)
 
     def _preprocess_feed(
         self,
