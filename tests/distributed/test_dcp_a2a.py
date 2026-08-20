@@ -17,6 +17,7 @@ import torch.distributed as dist
 
 import vllm.envs as envs
 from vllm.config.parallel import ParallelConfig
+from vllm.platforms import current_platform
 from vllm.utils.network_utils import get_open_port
 from vllm.utils.system_utils import update_environment_variables
 
@@ -375,6 +376,63 @@ class TestPackedA2AKernels:
         else:
             _assert_packed_a2a_close(actual, expected_out, dtype)
 
+    @pytest.mark.skipif(
+        not current_platform.is_cuda() or current_platform.device_count() < 1,
+        reason="CUDA is required.",
+    )
+    @pytest.mark.parametrize("is_lse_base_on_e", [False, True])
+    def test_fp8_pack_unpack_combine_matches_reference(self, is_lse_base_on_e: bool):
+        from vllm.v1.attention.ops.dcp_alltoall import (
+            _dcp_fp8_a2a_pack_send,
+            _dcp_fp8_a2a_send_recv_buffers,
+            _dcp_fp8_a2a_unpack_combine,
+        )
+
+        torch.manual_seed(0)
+        device = torch.device("cuda")
+        world_size, B, h_per_rank, D = 4, 7, 2, 128
+        H = world_size * h_per_rank
+        cp_attn_out = torch.randn(B, H, D, device=device, dtype=torch.bfloat16)
+        cp_attn_lse = torch.randn(B, H, device=device, dtype=torch.float32)
+        q_send, _, meta_send, _ = _dcp_fp8_a2a_send_recv_buffers(
+            (world_size, B, h_per_rank, D), device
+        )
+
+        assert q_send.shape == (world_size, B, h_per_rank, D)
+        assert q_send.dtype == torch.float8_e4m3fn
+        assert meta_send.shape == (world_size, B, h_per_rank, 2)
+        assert meta_send.dtype == torch.float32
+
+        _dcp_fp8_a2a_pack_send(
+            cp_attn_out,
+            cp_attn_lse,
+            q_send,
+            meta_send,
+            world_size,
+            h_per_rank,
+            D,
+        )
+        actual_out, actual_lse = _dcp_fp8_a2a_unpack_combine(
+            q_send,
+            meta_send,
+            torch.bfloat16,
+            return_lse=True,
+            is_lse_base_on_e=is_lse_base_on_e,
+        )
+        expected_out, expected_lse = _packed_a2a_reference(
+            cp_attn_out, cp_attn_lse, world_size, h_per_rank, is_lse_base_on_e
+        )
+
+        cosine = torch.nn.functional.cosine_similarity(
+            actual_out.float().reshape(1, -1), expected_out.reshape(1, -1)
+        )
+        normalized_mae = (
+            actual_out.float() - expected_out
+        ).abs().mean() / expected_out.abs().mean().clamp_min(1e-8)
+        assert cosine.item() > 0.999
+        assert normalized_mae.item() < 0.03
+        torch.testing.assert_close(actual_lse, expected_lse, rtol=1e-4, atol=1e-4)
+
 
 def _distributed_packed_a2a_worker(env: dict[str, str]) -> None:
     update_environment_variables(env)
@@ -393,7 +451,10 @@ def _distributed_packed_a2a_worker(env: dict[str, str]) -> None:
 
         init_workspace_manager(torch.device(f"cuda:{local_rank}"))
     try:
-        from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
+        from vllm.v1.attention.ops.dcp_alltoall import (
+            dcp_a2a_lse_reduce,
+            dcp_fp8_a2a_lse_reduce,
+        )
 
         dtype = _dtype_from_name(env["TEST_DTYPE"])
         return_lse = env["RETURN_LSE"] == "1"
@@ -420,7 +481,10 @@ def _distributed_packed_a2a_worker(env: dict[str, str]) -> None:
             dtype=torch.float32,
             generator=generator,
         )
-        actual = dcp_a2a_lse_reduce(
+        combine = (
+            dcp_fp8_a2a_lse_reduce if env.get("USE_FP8") == "1" else dcp_a2a_lse_reduce
+        )
+        actual = combine(
             cp_attn_out,
             cp_attn_lse,
             _FakeCPGroup(world_size, dist.group.WORLD),
@@ -454,7 +518,14 @@ def _distributed_packed_a2a_worker(env: dict[str, str]) -> None:
 
         if return_lse:
             actual_out, actual_lse = actual
-            _assert_packed_a2a_close(actual_out, expected_out, dtype)
+            if env.get("USE_FP8") == "1":
+                cosine = torch.nn.functional.cosine_similarity(
+                    actual_out.float().reshape(1, -1),
+                    expected_out.reshape(1, -1),
+                )
+                assert cosine.item() > 0.999
+            else:
+                _assert_packed_a2a_close(actual_out, expected_out, dtype)
             torch.testing.assert_close(actual_lse, expected_lse, rtol=1e-4, atol=1e-4)
         else:
             _assert_packed_a2a_close(actual, expected_out, dtype)
@@ -494,6 +565,23 @@ def test_distributed_packed_a2a_with_workspace_matches_reference():
             "RETURN_LSE": "1",
             "LSE_BASE_E": "1",
             "USE_WORKSPACE": "1",
+        },
+    )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or current_platform.device_count() < 4,
+    reason="Need at least 4 CUDA GPUs.",
+)
+def test_distributed_fp8_a2a_matches_reference():
+    _distributed_run(
+        _distributed_packed_a2a_worker,
+        world_size=4,
+        extra_env={
+            "TEST_DTYPE": "bfloat16",
+            "RETURN_LSE": "1",
+            "LSE_BASE_E": "0",
+            "USE_FP8": "1",
         },
     )
 
