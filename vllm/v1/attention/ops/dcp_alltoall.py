@@ -129,6 +129,18 @@ def _dcp_a2a_send_recv_buffers(
     )
 
 
+def _dcp_fp8_a2a_send_recv_buffers(
+    shape: tuple[int, ...],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    q_send = torch.empty(shape, device=device, dtype=torch.float8_e4m3fn)
+    q_recv = torch.empty_like(q_send)
+    meta_shape = shape[:-1] + (2,)
+    meta_send = torch.empty(meta_shape, device=device, dtype=torch.float32)
+    meta_recv = torch.empty_like(meta_send)
+    return q_send, q_recv, meta_send, meta_recv
+
+
 @triton.jit
 def _dcp_a2a_pack_send_kernel(
     out_ptr,
@@ -316,6 +328,160 @@ def _dcp_a2a_unpack_combine_kernel(
         tl.store(out_lse_ptr + out_lse_offset, global_lse)
 
 
+@triton.jit
+def _dcp_fp8_a2a_pack_send_kernel(
+    out_ptr,
+    lse_ptr,
+    q_send_ptr,
+    meta_send_ptr,
+    out_stride_B,
+    out_stride_H,
+    out_stride_D,
+    lse_stride_B,
+    lse_stride_H,
+    q_stride_N,
+    q_stride_B,
+    q_stride_H,
+    q_stride_D,
+    meta_stride_N,
+    meta_stride_B,
+    meta_stride_H,
+    meta_stride_D,
+    N: tl.constexpr,
+    H_PER_RANK: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    batch_idx = tl.program_id(0).to(tl.int64)
+    local_head_idx = tl.program_id(1).to(tl.int64)
+    d_offsets = tl.arange(0, HEAD_DIM)
+
+    for rank_idx in tl.static_range(N):
+        src_head_idx = rank_idx * H_PER_RANK + local_head_idx
+        values = tl.load(
+            out_ptr
+            + batch_idx * out_stride_B
+            + src_head_idx * out_stride_H
+            + d_offsets * out_stride_D
+        ).to(tl.float32)
+        scale = tl.maximum(tl.max(tl.abs(values), axis=0) / 448.0, 1.0e-8)
+        q_base = (
+            rank_idx * q_stride_N + batch_idx * q_stride_B + local_head_idx * q_stride_H
+        )
+        tl.store(
+            q_send_ptr + q_base + d_offsets * q_stride_D,
+            (values / scale).to(tl.float8e4nv),
+        )
+
+        meta_base = (
+            rank_idx * meta_stride_N
+            + batch_idx * meta_stride_B
+            + local_head_idx * meta_stride_H
+        )
+        tl.store(meta_send_ptr + meta_base, scale)
+        tl.store(
+            meta_send_ptr + meta_base + meta_stride_D,
+            tl.load(lse_ptr + batch_idx * lse_stride_B + src_head_idx * lse_stride_H),
+        )
+
+
+@triton.jit
+def _dcp_fp8_a2a_unpack_combine_kernel(
+    q_recv_ptr,
+    meta_recv_ptr,
+    out_ptr,
+    out_lse_ptr,
+    q_stride_N,
+    q_stride_B,
+    q_stride_H,
+    q_stride_D,
+    meta_stride_N,
+    meta_stride_B,
+    meta_stride_H,
+    meta_stride_D,
+    out_stride_B,
+    out_stride_H,
+    out_stride_D,
+    out_lse_stride_B,
+    out_lse_stride_H,
+    N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    IS_BASE_E: tl.constexpr,
+    RETURN_LSE: tl.constexpr,
+):
+    batch_idx = tl.program_id(0).to(tl.int64)
+    head_idx = tl.program_id(1).to(tl.int64)
+    d_offsets = tl.arange(0, HEAD_DIM)
+
+    lse_max = -float("inf")
+    for rank_idx in tl.static_range(N):
+        meta_base = (
+            rank_idx * meta_stride_N
+            + batch_idx * meta_stride_B
+            + head_idx * meta_stride_H
+        )
+        lse_val = tl.load(meta_recv_ptr + meta_base + meta_stride_D)
+        lse_val = tl.where(
+            (lse_val != lse_val) | (lse_val == float("inf")),
+            -float("inf"),
+            lse_val,
+        )
+        lse_max = tl.maximum(lse_max, lse_val)
+    lse_max = tl.where(lse_max == -float("inf"), 0.0, lse_max)
+
+    lse_sum = 0.0
+    for rank_idx in tl.static_range(N):
+        meta_base = (
+            rank_idx * meta_stride_N
+            + batch_idx * meta_stride_B
+            + head_idx * meta_stride_H
+        )
+        lse_val = tl.load(meta_recv_ptr + meta_base + meta_stride_D)
+        lse_val = tl.where(
+            (lse_val != lse_val) | (lse_val == float("inf")),
+            -float("inf"),
+            lse_val,
+        )
+        if IS_BASE_E:
+            lse_sum += tl.exp(lse_val - lse_max)
+        else:
+            lse_sum += tl.exp2(lse_val - lse_max)
+    if IS_BASE_E:  # noqa: SIM108
+        global_lse = tl.log(lse_sum) + lse_max
+    else:
+        global_lse = tl.log2(lse_sum) + lse_max
+
+    acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
+    for rank_idx in tl.static_range(N):
+        meta_base = (
+            rank_idx * meta_stride_N
+            + batch_idx * meta_stride_B
+            + head_idx * meta_stride_H
+        )
+        scale = tl.load(meta_recv_ptr + meta_base)
+        lse_val = tl.load(meta_recv_ptr + meta_base + meta_stride_D)
+        lse_val = tl.where(
+            (lse_val != lse_val) | (lse_val == float("inf")),
+            -float("inf"),
+            lse_val,
+        )
+        if IS_BASE_E:
+            weight = tl.exp(lse_val - global_lse)
+        else:
+            weight = tl.exp2(lse_val - global_lse)
+        weight = tl.where(weight != weight, 0.0, weight)
+        q_base = rank_idx * q_stride_N + batch_idx * q_stride_B + head_idx * q_stride_H
+        values = tl.load(q_recv_ptr + q_base + d_offsets * q_stride_D).to(tl.float32)
+        acc += values * scale * weight
+
+    out_offset = (
+        batch_idx * out_stride_B + head_idx * out_stride_H + d_offsets * out_stride_D
+    )
+    tl.store(out_ptr + out_offset, acc)
+    if RETURN_LSE:
+        out_lse_offset = batch_idx * out_lse_stride_B + head_idx * out_lse_stride_H
+        tl.store(out_lse_ptr + out_lse_offset, global_lse)
+
+
 def _dcp_a2a_pack_send(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
@@ -343,6 +509,31 @@ def _dcp_a2a_pack_send(
         HEAD_DIM=head_dim,
         H_PER_RANK=h_per_rank,
         LSE_PACK_DIM=lse_pack_dim,
+    )
+
+
+def _dcp_fp8_a2a_pack_send(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    q_send: torch.Tensor,
+    meta_send: torch.Tensor,
+    world_size: int,
+    h_per_rank: int,
+    head_dim: int,
+) -> None:
+    _dcp_fp8_a2a_pack_send_kernel[(cp_attn_out.shape[0], h_per_rank, 1)](
+        cp_attn_out,
+        cp_attn_lse,
+        q_send,
+        meta_send,
+        *cp_attn_out.stride(),
+        *cp_attn_lse.stride(),
+        *q_send.stride(),
+        *meta_send.stride(),
+        N=world_size,
+        H_PER_RANK=h_per_rank,
+        HEAD_DIM=head_dim,
+        num_warps=8,
     )
 
 
@@ -383,6 +574,44 @@ def _dcp_a2a_unpack_combine(
         IS_BASE_E=is_lse_base_on_e,
         RETURN_LSE=return_lse,
         LSE_PACK_DIM=lse_pack_dim,
+    )
+    if return_lse:
+        return out, out_lse
+    return out
+
+
+def _dcp_fp8_a2a_unpack_combine(
+    q_recv: torch.Tensor,
+    meta_recv: torch.Tensor,
+    output_dtype: torch.dtype,
+    return_lse: bool,
+    is_lse_base_on_e: bool,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    world_size, num_tokens, h_per_rank, head_dim = q_recv.shape
+    out = torch.empty(
+        (num_tokens, h_per_rank, head_dim),
+        device=q_recv.device,
+        dtype=output_dtype,
+    )
+    out_lse = torch.empty(
+        (num_tokens, h_per_rank) if return_lse else (1, 1),
+        device=q_recv.device,
+        dtype=torch.float32,
+    )
+    _dcp_fp8_a2a_unpack_combine_kernel[(num_tokens, h_per_rank, 1)](
+        q_recv,
+        meta_recv,
+        out,
+        out_lse,
+        *q_recv.stride(),
+        *meta_recv.stride(),
+        *out.stride(),
+        *out_lse.stride(),
+        N=world_size,
+        HEAD_DIM=head_dim,
+        IS_BASE_E=is_lse_base_on_e,
+        RETURN_LSE=return_lse,
+        num_warps=8,
     )
     if return_lse:
         return out, out_lse
@@ -458,4 +687,66 @@ def dcp_a2a_lse_reduce(
 
     return _dcp_a2a_unpack_combine(
         recv_buffer, D, lse_pack_dim, return_lse, is_lse_base_on_e
+    )
+
+
+def dcp_fp8_a2a_lse_reduce(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+    ctx: CPTritonContext | None = None,
+    return_lse: bool = False,
+    is_lse_base_on_e: bool = True,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Combine DCP outputs after dynamic per-head FP8 A2A transport."""
+    world_size = cp_group.world_size
+    if world_size == 1:
+        if return_lse:
+            return cp_attn_out, cp_attn_lse
+        return cp_attn_out
+
+    num_tokens, num_heads, head_dim = cp_attn_out.shape
+    if num_heads % world_size != 0:
+        raise ValueError(
+            f"H={num_heads} must be divisible by DCP world size {world_size}."
+        )
+    if cp_attn_out.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            "FP8 DCP A2A requires bfloat16 or float16 attention outputs, got "
+            f"{cp_attn_out.dtype}."
+        )
+    if cp_attn_out.device.type != "cuda":
+        raise ValueError("FP8 DCP A2A is only supported on CUDA devices.")
+    if cp_attn_lse.dtype != torch.float32:
+        cp_attn_lse = cp_attn_lse.to(torch.float32)
+
+    h_per_rank = num_heads // world_size
+    q_send, q_recv, meta_send, meta_recv = _dcp_fp8_a2a_send_recv_buffers(
+        (world_size, num_tokens, h_per_rank, head_dim), cp_attn_out.device
+    )
+    _dcp_fp8_a2a_pack_send(
+        cp_attn_out,
+        cp_attn_lse,
+        q_send,
+        meta_send,
+        world_size,
+        h_per_rank,
+        head_dim,
+    )
+    dist.all_to_all_single(
+        q_recv.view(torch.uint8).view(-1),
+        q_send.view(torch.uint8).view(-1),
+        group=cp_group.device_group,
+    )
+    dist.all_to_all_single(
+        meta_recv.view(-1),
+        meta_send.view(-1),
+        group=cp_group.device_group,
+    )
+    return _dcp_fp8_a2a_unpack_combine(
+        q_recv,
+        meta_recv,
+        cp_attn_out.dtype,
+        return_lse,
+        is_lse_base_on_e,
     )

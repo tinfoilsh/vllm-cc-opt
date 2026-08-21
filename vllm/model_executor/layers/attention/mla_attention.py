@@ -275,7 +275,10 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.attention.ops.common import cp_lse_ag_out_ar, cp_lse_ag_out_rs
-from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
+from vllm.v1.attention.ops.dcp_alltoall import (
+    dcp_a2a_lse_reduce,
+    dcp_fp8_a2a_lse_reduce,
+)
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.ops.triton_merge_attn_states import mask_empty_context
 from vllm.v1.attention.selector import get_attn_backend
@@ -895,12 +898,29 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if self.impl.dcp_world_size > 1:
                 assert lse is not None
                 if self.dcp_a2a:
-                    attn_out = dcp_a2a_lse_reduce(
-                        attn_out,
-                        lse,
-                        get_dcp_group(),
-                        is_lse_base_on_e=self.impl.lse_base_on_e,
+                    dcp_group = get_dcp_group()
+                    is_decode_only = (
+                        attn_metadata.num_prefills == 0
+                        and attn_metadata.num_decode_tokens == num_actual_toks
                     )
+                    if (
+                        envs.VLLM_DCP_FP8_A2A
+                        and not is_decode_only
+                        and num_mqa_tokens >= envs.VLLM_DCP_FP8_A2A_MIN_TOKENS
+                    ):
+                        attn_out = dcp_fp8_a2a_lse_reduce(
+                            attn_out,
+                            lse,
+                            dcp_group,
+                            is_lse_base_on_e=self.impl.lse_base_on_e,
+                        )
+                    else:
+                        attn_out = dcp_a2a_lse_reduce(
+                            attn_out,
+                            lse,
+                            dcp_group,
+                            is_lse_base_on_e=self.impl.lse_base_on_e,
+                        )
                 elif self.use_pcp:
                     attn_out = cp_lse_ag_out_ar(
                         attn_out,
